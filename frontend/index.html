@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Peptide Generation Agent</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="sidebar-logo">
+      <div class="logo-icon">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="#00bcd4" stroke-width="2">
+          <path d="M2 12h4M18 12h4M12 2v4M12 18v4"/>
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83"/>
+        </svg>
+      </div>
+      <div class="logo-text">
+        <span class="logo-name">Peptide</span>
+        <span class="logo-sub">Agent</span>
+      </div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="section-label">QUICK START</div>
+      <button class="preset-btn preset-antimicrobial" onclick="applyPreset('antimicrobial')">
+        <span class="preset-icon">⚡</span>
+        <div class="preset-info">
+          <div class="preset-name">Antimicrobial</div>
+          <div class="preset-desc">Generate AMP with custom length and charge</div>
+        </div>
+      </button>
+      <button class="preset-btn preset-cpp" onclick="applyPreset('cpp')">
+        <span class="preset-icon">✏️</span>
+        <div class="preset-info">
+          <div class="preset-name">Cell-Penetrating</div>
+          <div class="preset-desc">Generate CPP peptide for drug delivery</div>
+        </div>
+      </button>
+      <button class="preset-btn preset-clear" onclick="clearForm()">
+        <span class="preset-icon">⊞</span>
+        <div class="preset-info">
+          <div class="preset-name">Clear</div>
+          <div class="preset-desc">Reset form and results</div>
+        </div>
+      </button>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="footer-row">
+        <span class="footer-label">Model:</span>
+        <span class="footer-value">OpenBioLLM-8B</span>
+      </div>
+      <div class="footer-row">
+        <span class="footer-label">Provider:</span>
+        <span class="footer-value">Bhaskera GPU Server</span>
+      </div>
+      <div class="footer-row">
+        <span class="footer-label">Status:</span>
+        <span class="status-dot" id="statusDot"></span>
+        <span class="footer-value" id="statusText">Ready</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content">
+    <header class="main-header">
+      <h1>Hey! Researcher 👋</h1>
+      <p>Generate novel peptide sequences with the OpenBioLLM agent</p>
+    </header>
+
+    <div class="panels">
+      <!-- LEFT PANEL: SPECIFICATION -->
+      <section class="panel panel-left">
+        <div class="panel-header">
+          <span class="panel-icon">📋</span>
+          <span class="panel-title">PEPTIDE SPECIFICATION</span>
+        </div>
+
+        <div class="prompt-preview-wrapper">
+          <textarea id="promptPreview" class="prompt-preview" readonly spellcheck="false"></textarea>
+        </div>
+
+        <div class="panel-section-label">
+          <span class="panel-icon">⚙️</span>
+          TARGET PROPERTIES
+        </div>
+
+        <div class="props-grid">
+          <div class="prop-field">
+            <label>Length</label>
+            <input type="number" id="inputLength" value="12" min="2" max="200" oninput="updatePreview()" />
+          </div>
+          <div class="prop-field">
+            <label>Charge</label>
+            <input type="number" id="inputCharge" value="5" step="0.5" oninput="updatePreview()" />
+          </div>
+          <div class="prop-field">
+            <label>Hydrophobicity</label>
+            <input type="number" id="inputHydro" value="0.5" step="0.1" oninput="updatePreview()" />
+          </div>
+          <div class="prop-field">
+            <label>Max Retries</label>
+            <input type="number" id="inputRetries" value="6" min="1" max="10" />
+          </div>
+        </div>
+
+        <div class="panel-section-label" style="margin-top:12px">
+          <span class="panel-icon">🏷️</span>
+          ACTIVITY FLAGS
+        </div>
+        <div class="activity-grid" id="activityGrid"></div>
+
+        <div class="ref-field">
+          <label>Reference Sequence <span class="optional">(optional — auto-selected from activity if blank)</span></label>
+          <input type="text" id="inputRef" placeholder="e.g. KLLKLLKLLK  (leave blank to use canonical default)" oninput="updatePreview()" class="ref-input" />
+        </div>
+
+        <div class="action-buttons">
+          <button class="btn-generate" id="btnGenerate" onclick="generate()">
+            ✨ GENERATE
+          </button>
+          <button class="btn-clear" onclick="clearForm()">CLEAR</button>
+        </div>
+      </section>
+
+      <!-- RIGHT PANEL: RESULTS -->
+      <section class="panel panel-right">
+        <div class="panel-header">
+          <span class="panel-icon">📊</span>
+          <span class="panel-title">RESULTS</span>
+        </div>
+
+        <!-- Agent Response -->
+        <div class="result-card" id="responseCard">
+          <div class="result-card-header">
+            <span class="result-icon">🤖</span>
+            AGENT RESPONSE
+          </div>
+          <div class="result-sequence" id="resultSequence">ASSISTANT</div>
+        </div>
+
+        <!-- Metrics bar -->
+        <div class="metrics-bar">
+          <div class="metric-badge metric-bleu" id="metricBleu">
+            <span class="metric-label">PeptideBLEU</span>
+            <span class="metric-value" id="bleuValue">0.0000</span>
+          </div>
+          <div class="metric-badge metric-rulebook" id="metricRulebook">
+            <span class="metric-label">Rulebook</span>
+            <span class="metric-value" id="rbScoreValue">0.0000</span>
+          </div>
+          <div class="metric-badge" id="metricIter">
+            <span class="metric-label">Iterations</span>
+            <span class="metric-value" id="iterValue">–</span>
+          </div>
+          <div class="metric-badge" id="metricTime">
+            <span class="metric-label">Time</span>
+            <span class="metric-value" id="timeValue">–</span>
+          </div>
+        </div>
+        <div class="ref-note" id="refNote"></div>
+
+        <!-- Execution Trace -->
+        <div class="result-card">
+          <div class="result-card-header">
+            <span class="result-icon">📋</span>
+            EXECUTION TRACE
+          </div>
+          <div id="traceList" class="trace-list">
+            <div class="trace-empty">Run generation to see trace</div>
+          </div>
+        </div>
+
+        <!-- Component Scores -->
+        <div class="result-card" id="componentCard" style="display:none">
+          <div class="result-card-header">
+            <span class="result-icon">📈</span>
+            COMPONENT SCORES
+          </div>
+          <div id="componentScores" class="component-scores"></div>
+        </div>
+      </section>
+    </div>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

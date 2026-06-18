@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+peptide-venv/
+data/faiss_cache/
+claude_cache/
+.claude/
