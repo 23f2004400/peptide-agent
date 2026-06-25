@@ -13,6 +13,7 @@ from . import models
 from .rulebook import validate_sequence, rulebook_score
 from .peptide_bleu import peptide_metric, score_components, ACTIVITY_WEIGHTS
 from .prompt_builder import build_prompt, get_system_prompt, build_feedback_entry
+from .trace_logger import TraceLogger
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,8 @@ class PeptideAgent:
         if not raw or not raw.strip():
             return ""
 
-        upper = raw.strip().upper()
+        raw_stripped = raw.strip()
+        upper = raw_stripped.upper()
 
         # Priority 1: a line that IS the sequence (only AA chars, nothing else)
         for line in upper.split('\n'):
@@ -160,32 +162,46 @@ class PeptideAgent:
             '', upper
         )
 
-        # Priority 3: regex search over both original and dash-collapsed text
-        candidates = []
-        for text in (upper, dash_collapsed):
-            for m in VALID_AA_RE.findall(text):
-                # Filter: discard any match that is a substring of the canonical
-                # alphabet string (these are the model echoing the instruction).
-                if m in CANONICAL_AA_ALPHABET:
+        # Priority 3: regex search — skip matches whose original span was
+        # lowercase (those are English words, not peptide sequences).
+        candidates: list[str] = []
+        seen: set[str] = set()
+
+        for m in VALID_AA_RE.finditer(upper):
+            match_str = m.group()
+            if match_str in CANONICAL_AA_ALPHABET or match_str in seen:
+                continue
+            # If every char in the original span was already uppercase the model
+            # wrote a real sequence; if any char is lowercase it is an English word
+            # that happens to use only AA characters (e.g. "answer" → ANSWER).
+            if not raw_stripped[m.start():m.end()].isupper():
+                logger.debug("extract: skipping lowercase-origin %r", match_str)
+                continue
+            seen.add(match_str)
+            candidates.append(match_str)
+
+        # Dash-collapsed candidates: position mapping is ambiguous so skip the
+        # origin check, but still deduplicate.
+        if dash_collapsed != upper:
+            for m in VALID_AA_RE.finditer(dash_collapsed):
+                match_str = m.group()
+                if match_str in CANONICAL_AA_ALPHABET or match_str in seen:
                     continue
-                candidates.append(m)
+                seen.add(match_str)
+                candidates.append(match_str)
 
         if not candidates:
             return ""
 
-        # Deduplicate while preserving order
-        seen: set[str] = set()
-        unique = [c for c in candidates if not (c in seen or seen.add(c))]  # type: ignore[func-returns-value]
+        logger.debug("extract: %d candidate(s): %s", len(candidates), candidates)
 
-        logger.debug("extract: %d candidate(s): %s", len(unique), unique)
-
-        if len(unique) == 1:
-            return unique[0]
+        if len(candidates) == 1:
+            return candidates[0]
 
         # Prefer the candidate closest to target length
         if target_length:
-            return min(unique, key=lambda m: abs(len(m) - target_length))
-        return max(unique, key=len)
+            return min(candidates, key=lambda m: abs(len(m) - target_length))
+        return max(candidates, key=len)
 
     def generate(self, task: dict, on_attempt=None) -> "AgentResult":
         """
@@ -224,10 +240,12 @@ class PeptideAgent:
         feedback_history: list[dict] = []
         best_result: Optional[AgentResult] = None
         trace: list[dict] = []
+        trace_log = TraceLogger(task)
 
         for attempt_num in range(1, max_retries + 1):
             prompt = build_prompt(task, feedback_history)
             system = get_system_prompt()
+            trace_log.log_prompt(attempt_num, prompt)
 
             logger.debug("[A%d] prompt (first 200 chars): %s", attempt_num, prompt[:200])
 
@@ -235,6 +253,7 @@ class PeptideAgent:
                 raw = models.generate(prompt, system=system)
             except Exception as exc:
                 logger.warning("[A%d] LLM call raised: %s", attempt_num, exc)
+                trace_log.log_llm_error(attempt_num, exc)
                 log = AttemptLog(
                     n=attempt_num, sequence='', score=None,
                     issues=[f"LLM error: {exc}"], passed=False,
@@ -245,10 +264,12 @@ class PeptideAgent:
                 feedback_history.append({'seq': '', 'score': None, 'issues': log.issues, 'fix_hints': []})
                 continue
 
+            trace_log.log_raw_response(attempt_num, raw)
             logger.debug("[A%d] raw output (%d chars): %r", attempt_num, len(raw), raw[:120])
 
             if not raw:
                 logger.warning("[A%d] empty response from model (all retries exhausted)", attempt_num)
+                trace_log.log_empty_response(attempt_num)
                 log = AttemptLog(
                     n=attempt_num, sequence='', score=None,
                     issues=["Empty response from model — server chat_template bug"], passed=False,
@@ -262,6 +283,7 @@ class PeptideAgent:
             seq = self.extract_sequence(raw, target_length)
             if not seq:
                 logger.warning("[A%d] extraction failed. Raw: %r", attempt_num, raw[:80])
+                trace_log.log_extraction_failure(attempt_num, raw)
                 log = AttemptLog(
                     n=attempt_num, sequence='', score=None,
                     issues=["Could not extract valid AA sequence from LLM output"],
@@ -326,6 +348,14 @@ class PeptideAgent:
 
             if passed:
                 logger.info("[A%d] threshold met — stopping early", attempt_num)
+                trace_log.log_iteration(
+                    attempt_num=attempt_num, task=task, seq=seq,
+                    validation=validation, rb_score=rb_score, comp=comp,
+                    score=score, passed=passed, fb={},
+                    effective_reference=effective_reference,
+                    reference_used=reference_used, threshold=threshold,
+                    next_prompt="",
+                )
                 break
 
             # Build rich feedback for the next attempt
@@ -342,6 +372,23 @@ class PeptideAgent:
                 if tgt_h is not None and abs(avg_h - tgt_h) > 0.3:
                     pass
             feedback_history.append(fb)
+
+            # Build next iteration's prompt now (while feedback is fresh) so we
+            # can log the exact prompt the model will see — this is read-only,
+            # no side effects; the loop rebuilds it identically at the top.
+            next_prompt = (
+                build_prompt(task, feedback_history)
+                if attempt_num < max_retries
+                else ""
+            )
+            trace_log.log_iteration(
+                attempt_num=attempt_num, task=task, seq=seq,
+                validation=validation, rb_score=rb_score, comp=comp,
+                score=score, passed=passed, fb=fb,
+                effective_reference=effective_reference,
+                reference_used=reference_used, threshold=threshold,
+                next_prompt=next_prompt,
+            )
 
         elapsed = round(time.time() - t0, 2)
 
@@ -362,6 +409,16 @@ class PeptideAgent:
 
         best_result.time_seconds = elapsed
         best_result.trace = trace
+
+        trace_log.log_final_summary(
+            best_sequence=best_result.sequence,
+            best_score=best_result.score if best_result.score != 0.0 else None,
+            best_rb_score=best_result.rulebook_score,
+            best_iteration=best_result.iterations,
+            total_iterations=len(trace),
+            elapsed=elapsed,
+        )
+
         return best_result
 
 

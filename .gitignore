@@ -8,3 +8,4 @@ peptide-venv/
 data/faiss_cache/
 claude_cache/
 .claude/
+logs/
