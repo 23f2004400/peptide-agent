@@ -196,12 +196,17 @@ class PeptideAgent:
         logger.debug("extract: %d candidate(s): %s", len(candidates), candidates)
 
         if len(candidates) == 1:
-            return candidates[0]
+            best = candidates[0]
+        elif target_length is not None:
+            best = min(candidates, key=lambda m: abs(len(m) - target_length))
+        else:
+            best = max(candidates, key=len)
 
-        # Prefer the candidate closest to target length
-        if target_length:
-            return min(candidates, key=lambda m: abs(len(m) - target_length))
-        return max(candidates, key=len)
+        # Trim to target length if model overshot (e.g. repetitive continuation)
+        if target_length and len(best) > target_length:
+            best = best[:target_length]
+
+        return best
 
     def generate(self, task: dict, on_attempt=None) -> "AgentResult":
         """
@@ -237,6 +242,12 @@ class PeptideAgent:
             effective_reference = ''
             reference_used = 'none'
 
+        # Primer forces the model to continue with AA letters instead of prose.
+        # The assistant turn already starts with these chars, so the model
+        # cannot begin with "Explanation:" or other preambles.
+        _PRIMERS = {'amp': 'KLL', 'cpp': 'RKK', 'signal': 'MSV', 'immunological': 'GIL'}
+        assistant_primer = _PRIMERS.get(activity_preset or '', 'KL')
+
         feedback_history: list[dict] = []
         best_result: Optional[AgentResult] = None
         trace: list[dict] = []
@@ -250,7 +261,11 @@ class PeptideAgent:
             logger.debug("[A%d] prompt (first 200 chars): %s", attempt_num, prompt[:200])
 
             try:
-                raw = models.generate(prompt, system=system)
+                raw = models.generate(
+                    prompt, system=system,
+                    assistant_primer=assistant_primer,
+                    max_tokens=target_length + 5,
+                )
             except Exception as exc:
                 logger.warning("[A%d] LLM call raised: %s", attempt_num, exc)
                 trace_log.log_llm_error(attempt_num, exc)
@@ -281,6 +296,9 @@ class PeptideAgent:
                 continue
 
             seq = self.extract_sequence(raw, target_length)
+            # Trim to target length if model overshot (stop=["\n"] doesn't bound length)
+            if seq and len(seq) > target_length:
+                seq = seq[:target_length]
             if not seq:
                 logger.warning("[A%d] extraction failed. Raw: %r", attempt_num, raw[:80])
                 trace_log.log_extraction_failure(attempt_num, raw)
@@ -292,7 +310,7 @@ class PeptideAgent:
                 trace.append(_log_to_dict(log))
                 if on_attempt:
                     on_attempt(log)
-                feedback_history.append({'seq': raw[:50], 'score': None, 'issues': log.issues, 'fix_hints': []})
+                feedback_history.append({'seq': '', 'score': None, 'issues': log.issues, 'fix_hints': []})
                 continue
 
             logger.debug("[A%d] extracted: %r (len=%d)", attempt_num, seq, len(seq))

@@ -35,80 +35,89 @@ _ACTIVITY_LABELS = {
 }
 
 BASE_SYSTEM = (
-    "You are a computational biochemist. "
-    "When asked to design a peptide, respond with ONLY the amino acid sequence "
-    "in uppercase single-letter codes — nothing else."
+    "You are a peptide sequence generator. "
+    "Your entire response must be ONE LINE containing only the amino acid sequence "
+    "in uppercase single-letter codes (A C D E F G H I K L M N P Q R S T V W Y). "
+    "No explanation, no labels, no punctuation — just the letters."
 )
 
 
-def build_prompt(task: dict, feedback_history: list[dict] | None = None) -> str:
-    """
-    Build a compact, completion-primed prompt for OpenBioLLM.
+# Multiple candidate examples per preset so retries rotate through different ones.
+# Each example has a different amino acid composition — model won't always copy the same one.
+_AMP_EXAMPLES = [
+    "GIGKFLKKAKKFGKAF",   # magainin-like, charge +5
+    "KLNKSGLKSFLVATS",   # charge +3, ~40% hydrophobic
+    "KFLKLFVKASHLLVS",   # charge +3, amphipathic
+    "KLLKLLKLWKKLSAL",   # charge +4, strong AMP
+]
+_CPP_EXAMPLES = [
+    "RKKRKLLLKRKLLLK",
+    "GRKKRRQRRRPQKLK",
+    "KALAKALAKALAKAL",
+]
+_SIGNAL_EXAMPLES = [
+    "MSVPTQVLGLLLLWL",
+    "MKFLILLFNILCLFP",
+]
+_IMMUNO_EXAMPLES = [
+    "SIINFEKLFGILGFV",
+    "GILGFVFTLKLFLKL",
+]
 
-    Improvements over v1:
-    - Shorter: ~50% fewer tokens → less likely to trigger chatty responses
-    - No listing of all inactive activities (the long "is NOT …" list)
-    - Hydrophobicity expressed as % hydrophobic residues (more intuitive for LLM)
-    - "Sequence:" at end primes the model to continue with the sequence
-    - Feedback gives specific amino-acid substitution instructions
-    """
+
+def _get_example(activities: list[str], length: int, attempt: int = 0) -> str:
+    if "drug-delivery" in activities or "cell-cell-communication" in activities:
+        pool = _CPP_EXAMPLES
+    elif any(a in activities for a in ("anti-bacterial", "anti-fungal", "anti-viral", "anti-cancer")):
+        pool = _AMP_EXAMPLES
+    elif "signal-peptide" in activities:
+        pool = _SIGNAL_EXAMPLES
+    elif "immunological" in activities:
+        pool = _IMMUNO_EXAMPLES
+    else:
+        pool = _AMP_EXAMPLES
+    base = pool[attempt % len(pool)]
+    return (base + "KLKLKLKLKLKLKLKL")[:length]
+
+
+def build_prompt(task: dict, feedback_history: list[dict] | None = None) -> str:
     length     = task.get('length', 12)
     charge     = task.get('charge', 0)
     hydro      = task.get('hydrophobicity', 0.0)
     activities = task.get('activities', [])
 
-    # Estimate hydrophobic residue % from target Kyte-Doolittle avg
-    # KD avg 0 ≈ 30%, 0.5 ≈ 40%, 1.0 ≈ 50%, -1.0 ≈ 20%
-    hydro_pct = max(10, min(80, int(30 + hydro * 20)))
-
-    act_labels = [_ACTIVITY_LABELS.get(a, a) for a in activities]
-    act_str = ", ".join(act_labels) if act_labels else "general"
-
+    hydro_pct   = max(10, min(80, int(30 + hydro * 20)))
+    act_labels  = [_ACTIVITY_LABELS.get(a, a) for a in activities]
+    act_str     = ", ".join(act_labels) if act_labels else "general"
     charge_sign = f"+{int(charge)}" if charge >= 0 else str(int(charge))
+    attempt     = len(feedback_history) if feedback_history else 0
+    example     = _get_example(activities, length, attempt)
+
+    if not feedback_history:
+        return (
+            f"Generate a {length}-residue {act_str} peptide sequence.\n"
+            f"Net charge {charge_sign} (K=+1, R=+1, H=+1, D=-1, E=-1). "
+            f"About {hydro_pct}% hydrophobic residues (L,I,V,F,W,M,A,Y,C are hydrophobic).\n"
+            f"Output only uppercase amino acid letters on one line.\n"
+            f"Example: {example}\n"
+            f"Sequence:"
+        )
+
+    # Retry — minimal, direct; avoid commentary language that triggers explanation mode
+    prev     = feedback_history[-1]
+    prev_seq = prev.get('seq') or ''
+    issues   = prev.get('issues', [])
+    hints    = prev.get('fix_hints', [])
 
     lines = [
-        f"Design a {act_str} peptide:",
-        "",
-        f"  Length : exactly {length} amino acids",
-        f"  Charge : {charge_sign}  ({_CHARGE_REF})",
-        f"  Hydrophobicity : ~{hydro_pct}% hydrophobic residues  ({_HYDRO_REF})",
-        "",
-        "Rules: uppercase single-letter codes only (A C D E F G H I K L M N P Q R S T V W Y).",
-        "Output the sequence on a single line with no labels, spaces, or dashes.",
-        "",
+        f"{length}-residue {act_str} peptide, charge {charge_sign}, "
+        f"~{hydro_pct}% hydrophobic (K=+1,R=+1,D=-1,E=-1). Output: {example}",
     ]
 
-    # Add a worked example for the first attempt to show the model the expected format
-    if not feedback_history:
-        if "drug-delivery" in activities or "cell-cell-communication" in activities:
-            example = "RKKRKLLLKRKLLLK"[:length] or "KLLKLLLKLWKK"
-        elif any(a in activities for a in ("anti-bacterial","anti-fungal","anti-viral","anti-cancer")):
-            example = "GIGKFLKKAKKFGKAF"[:length] or "KLLKLLKLWKK"
-        else:
-            example = "RKKRQLLKKLWKK"[:length] or "KLLKLLLKLWKK"
-        # Pad/trim example to target length using canonical AA pattern
-        if len(example) < length:
-            filler = "KLKLKLKLKLKLKLKLKL"
-            example = (example + filler)[:length]
-        lines.append(f"Example format (do NOT copy exactly): {example}")
-        lines.append("")
-
-    if feedback_history:
-        lines.append("PREVIOUS ATTEMPTS — do NOT repeat these sequences:")
-        lines.append("")
-        for i, fb in enumerate(feedback_history, 1):
-            seq = fb.get('seq') or '(no sequence)'
-            score_str = f"{fb['score']:.4f}" if fb.get('score') is not None else "N/A"
-            lines.append(f"  Attempt {i}: {seq}  (score {score_str})")
-            if fb.get('issues'):
-                for issue in fb['issues']:
-                    lines.append(f"    PROBLEM: {issue}")
-            if fb.get('fix_hints'):
-                for hint in fb['fix_hints']:
-                    lines.append(f"    FIX:     {hint}")
-        lines.append("")
-        lines.append("Generate a NEW sequence that fixes ALL problems above.")
-        lines.append("")
+    if prev_seq and len(prev_seq) >= 5 and prev_seq == prev_seq.upper():
+        lines.append(f"Avoid: {prev_seq}")
+        for hint in hints[:2]:
+            lines.append(f"Instead: {hint}")
 
     lines.append("Sequence:")
     return "\n".join(lines)

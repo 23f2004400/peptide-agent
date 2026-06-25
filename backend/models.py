@@ -33,32 +33,30 @@ def generate(
     prompt: str,
     max_tokens: int = 512,
     system: str | None = None,
+    assistant_primer: str = "",
 ) -> str:
     """
     Call the LLM and return the raw text response.
 
-    The OpenBioLLM-Llama3-8B deployment has no chat_template configured on
-    its tokenizer, so it falls back to a plain role/content format with no
-    assistant-priming tokens. This makes the model frequently predict EOS
-    immediately (empty completion). Per the server maintainer, the
-    per-request `temperature` field is not wired through to the sampling
-    params — it's fixed by configs/openbiollm.yaml's inference.temperature
-    and only changes if that file is edited and the server restarted. So:
-      - no system role is sent (folded into the user message instead)
-      - `temperature` is accepted for API compatibility but never sent to
-        the server, since it has no effect there
-      - empty completions are retried plainly (do_sample=true still gives
-        each retry a fresh chance even at a fixed temperature)
+    assistant_primer: if non-empty, added as a partial assistant message so
+    the model is forced to CONTINUE from that text rather than starting fresh.
+    This prevents the model from outputting "Explanation:" style preambles —
+    when the assistant turn already begins with "KLL", the model continues
+    with more amino acid letters.  The primer is prepended to the returned
+    string so the caller sees the complete sequence.
     """
     client = _get_client()
     model = get_model_name()
 
     user_content = f"{system}\n\n{prompt}" if system else prompt
-    messages = [{"role": "user", "content": user_content}]
+    messages: list[dict] = [{"role": "user", "content": user_content}]
+    if assistant_primer:
+        messages.append({"role": "assistant", "content": assistant_primer})
 
     for attempt in range(1 + EMPTY_RETRY_ATTEMPTS):
         response = client.chat.completions.create(
             model=model, messages=messages, max_tokens=max_tokens,
+            stop=["\n"],
         )
         tokens = response.usage.completion_tokens if response.usage else 0
         if tokens > 0:
@@ -67,7 +65,7 @@ def generate(
                 "model ok (internal attempt %d/%d): tokens=%d content=%r",
                 attempt + 1, 1 + EMPTY_RETRY_ATTEMPTS, tokens, content[:80],
             )
-            return content
+            return assistant_primer + content
         logger.warning(
             "empty response (internal attempt %d/%d) — model returned 0 tokens",
             attempt + 1, 1 + EMPTY_RETRY_ATTEMPTS,
