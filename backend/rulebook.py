@@ -67,18 +67,9 @@ def validate_sequence(seq: str, task: dict) -> dict:
     """
     Validate a peptide sequence against task constraints.
 
-    task keys (all optional except they come from frontend):
-      length, charge, hydrophobicity, activities (list[str])
-
-    Returns:
-      valid: bool
-      issues: list[str]
-      net_charge: float
-      hydrophobicity: float
-      hydro_percent: float
-      length: int
-      charge_class: str
-      length_class: str
+    Supports both range-based keys (length_min/max, charge_min/max, hydro_min/max)
+    and legacy single-value keys (length, charge, hydrophobicity, ref_net_charge,
+    ref_hydrophobic_pct).  Range keys take priority when present.
     """
     issues: list[str] = []
     seq = seq.upper().strip()
@@ -94,33 +85,80 @@ def validate_sequence(seq: str, task: dict) -> dict:
     net_charge = sum(CHARGE_MAP.get(aa, 0) for aa in seq_clean)
     hydro_vals = [KD_HYDRO.get(aa, 0) for aa in seq_clean]
     avg_hydro = sum(hydro_vals) / max(n, 1)
-    hydro_pct = sum(1 for aa in seq_clean if aa in HYDROPHOBIC_AAS) / max(n, 1) * 100
+    hydro_pct = round(sum(1 for aa in seq_clean if aa in HYDROPHOBIC_AAS) / max(n, 1) * 100, 1)
 
     # Rule 2: length check
-    target_len = task.get('length')
-    if target_len is not None:
+    if 'length_min' in task and 'length_max' in task:
+        len_lo = int(task['length_min'])
+        len_hi = int(task['length_max'])
+        if not (len_lo <= n <= len_hi):
+            issues.append(f"Length {n} outside range {len_lo}–{len_hi}")
+    elif task.get('length') is not None:
+        target_len = task['length']
         if abs(n - target_len) > 2:
-            issues.append(
-                f"Length {n} is outside tolerance (target {target_len} ± 2)"
-            )
+            issues.append(f"Length {n} is outside tolerance (target {target_len} ± 2)")
 
     # Rule 3: net charge check
-    target_charge = task.get('charge')
-    if target_charge is not None:
-        if abs(net_charge - target_charge) > 2:
-            issues.append(
-                f"Net charge {net_charge:+.0f} is outside tolerance "
-                f"(target {target_charge:+.0f} ± 2)"
-            )
+    if 'charge_min' in task and 'charge_max' in task:
+        c_lo = float(task['charge_min'])
+        c_hi = float(task['charge_max'])
+        if not (c_lo <= net_charge <= c_hi):
+            if net_charge < c_lo:
+                issues.append(
+                    f"Net charge {net_charge:+.0f} too low "
+                    f"(target {c_lo:+.0f} to {c_hi:+.0f}): add K or R residues."
+                )
+            else:
+                issues.append(
+                    f"Net charge {net_charge:+.0f} too high "
+                    f"(target {c_lo:+.0f} to {c_hi:+.0f}): add D/E or replace K/R."
+                )
+    else:
+        target_charge = task.get('charge') if 'charge' in task else task.get('ref_net_charge')
+        if target_charge is not None:
+            target_charge = float(target_charge)
+            if abs(net_charge - target_charge) >= 2:
+                diff = int(net_charge - target_charge)
+                if diff > 0:
+                    issues.append(
+                        f"Net charge {net_charge:+.0f} too high "
+                        f"(target {target_charge:+.0f} ± 1): "
+                        f"replace {diff} K/R with neutral AA or add D/E."
+                    )
+                else:
+                    issues.append(
+                        f"Net charge {net_charge:+.0f} too low "
+                        f"(target {target_charge:+.0f} ± 1): "
+                        f"replace {abs(diff)} neutral AA with K or R."
+                    )
 
     # Rule 4: hydrophobicity check
-    target_hydro = task.get('hydrophobicity')
-    if target_hydro is not None:
-        if abs(avg_hydro - target_hydro) > 0.5:
+    if 'hydro_min' in task and 'hydro_max' in task:
+        h_lo = float(task['hydro_min'])
+        h_hi = float(task['hydro_max'])
+        if not (h_lo <= hydro_pct <= h_hi):
+            direction = ('add L/I/V/F/W/M/A' if hydro_pct < h_lo
+                         else 'replace L/I/V/F/W with S/T/N/Q/G')
             issues.append(
-                f"Avg hydrophobicity {avg_hydro:.3f} is outside tolerance "
-                f"(target {target_hydro:.3f} ± 0.5)"
+                f"Hydrophobicity {hydro_pct:.1f}% outside range "
+                f"{h_lo:.0f}%–{h_hi:.0f}%: {direction}."
             )
+    elif task.get('ref_hydrophobic_pct') is not None:
+        target_hydro_pct = float(task['ref_hydrophobic_pct'])
+        if abs(hydro_pct - target_hydro_pct) > 15:
+            issues.append(
+                f"Hydrophobicity {hydro_pct:.1f}% outside target "
+                f"{target_hydro_pct:.1f}% ± 15%: "
+                f"{'add L/I/V/F/W/M/A' if hydro_pct < target_hydro_pct else 'replace L/I/V/F/W with S/T/N/Q/G'}."
+            )
+    else:
+        target_hydro = task.get('hydrophobicity')
+        if target_hydro is not None:
+            if abs(avg_hydro - target_hydro) > 0.5:
+                issues.append(
+                    f"Avg hydrophobicity {avg_hydro:.3f} is outside tolerance "
+                    f"(target {target_hydro:.3f} ± 0.5)"
+                )
 
     # Rule 5: no more than 3 consecutive prolines
     import re

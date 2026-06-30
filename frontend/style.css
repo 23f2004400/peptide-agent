@@ -427,6 +427,52 @@ body { display: flex; min-height: 100vh; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
+/* ── Range inputs ────────────────────────────────────────────────────────── */
+.range-field .range-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.range-row input {
+  flex: 1;
+  min-width: 0;
+}
+.range-sep {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+/* ── Mode badge ──────────────────────────────────────────────────────────── */
+.panel-header { justify-content: flex-start; }
+.mode-badge {
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: rgba(0,188,212,0.1);
+  border: 1px solid rgba(0,188,212,0.3);
+  color: var(--cyan);
+}
+
+/* ── Custom hint ─────────────────────────────────────────────────────────── */
+.custom-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-style: italic;
+  padding: 4px 2px 8px;
+  line-height: 1.5;
+}
+.prompt-preview[contenteditable], .prompt-preview:not([readonly]) {
+  color: var(--text-primary);
+  border-color: #3b82f6;
+}
+
+/* ── Custom preset button ────────────────────────────────────────────────── */
+.preset-custom .preset-name { color: #60a5fa; }
+
 /* ── Responsive ──────────────────────────────────────────────────────────── */
 @media (max-width: 900px) {
   .panels { grid-template-columns: 1fr; }

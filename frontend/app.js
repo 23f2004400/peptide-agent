@@ -18,9 +18,11 @@ const COMPONENT_LABELS = {
   blosum: 'BLOSUM62',
 };
 
-/* ── Init ────────────────────────────────────────────────────────────────── */
+/* ── State ───────────────────────────────────────────────────────────────── */
 let activeActivities = new Set();
+let customMode = false;   // true = free-text prompt mode
 
+/* ── Init ────────────────────────────────────────────────────────────────── */
 function init() {
   buildActivityGrid();
   updatePreview();
@@ -47,59 +49,106 @@ function toggleActivity(act, checked) {
   updatePreview();
 }
 
-/* ── Prompt preview (mirrors prompt_builder.py) ──────────────────────────── */
+/* ── Custom prompt mode toggle ───────────────────────────────────────────── */
+function toggleCustomMode() {
+  customMode = !customMode;
+  const preview   = document.getElementById('promptPreview');
+  const hint      = document.getElementById('customHint');
+  const form      = document.getElementById('structuredForm');
+  const controls  = document.getElementById('customControls');
+  const badge     = document.getElementById('modeBadge');
+  const btnLabel  = document.getElementById('customBtnLabel');
+
+  if (customMode) {
+    preview.readOnly = false;
+    preview.style.color = 'var(--text-primary)';
+    preview.placeholder = 'Write your peptide specification here...\n\nExample:\nGenerate one antimicrobial peptide meeting ALL of:\n- Length: between 15 and 20 amino acids\n- Net charge: between +2 and +5\n- Hydrophobic residues (L,I,V,F,W,M,A): between 35% and 55%\n- Alphabet: standard amino acids only\n\nOutput: one line, uppercase letters only.\nSequence:';
+    preview.value = '';
+    hint.style.display = 'block';
+    form.style.display = 'none';
+    controls.style.display = 'block';
+    badge.textContent = 'CUSTOM';
+    badge.style.background = 'rgba(59,130,246,0.2)';
+    badge.style.color = '#60a5fa';
+    badge.style.borderColor = '#3b82f6';
+    btnLabel.textContent = '← Back to Form';
+  } else {
+    preview.readOnly = true;
+    preview.style.color = '';
+    preview.placeholder = 'Fill in the fields below — prompt preview will appear here';
+    hint.style.display = 'none';
+    form.style.display = 'block';
+    controls.style.display = 'none';
+    badge.textContent = 'STRUCTURED';
+    badge.style.background = '';
+    badge.style.color = '';
+    badge.style.borderColor = '';
+    btnLabel.textContent = 'Custom Prompt';
+    updatePreview();
+  }
+}
+
+/* ── Prompt preview (mirrors prompt_builder.py logic) ────────────────────── */
 function buildPromptText() {
-  const length   = document.getElementById('inputLength').value || '?';
-  const charge   = parseFloat(document.getElementById('inputCharge').value) || 0;
-  const hydro    = document.getElementById('inputHydro').value || '?';
-  const acts     = [...activeActivities];
+  const lenMin    = parseInt(document.getElementById('inputLenMin').value)  || 15;
+  const lenMax    = parseInt(document.getElementById('inputLenMax').value)  || 20;
+  const chargeMin = parseInt(document.getElementById('inputChargeMin').value);
+  const chargeMax = parseInt(document.getElementById('inputChargeMax').value);
+  const hydroMin  = parseInt(document.getElementById('inputHydroMin').value) || 35;
+  const hydroMax  = parseInt(document.getElementById('inputHydroMax').value) || 55;
+  const acts      = [...activeActivities];
 
-  const actLines = ALL_ACTIVITIES.map(a =>
-    acts.includes(a) ? `- IS ${a}` : `- is NOT ${a}`
-  ).join('\n');
+  const actLabels = {
+    'anti-bacterial': 'antimicrobial (AMP)', 'anti-fungal': 'antifungal (AMP)',
+    'anti-viral': 'antiviral (AMP)', 'anti-cancer': 'anticancer (AMP)',
+    'drug-delivery': 'cell-penetrating (CPP)', 'signal-peptide': 'signal peptide',
+    'immunological': 'immunological / epitope',
+  };
+  const actStr = acts.length
+    ? acts.map(a => actLabels[a] || a).join(', ')
+    : 'general';
 
-  const chargeStr = charge >= 0 ? `+${charge}` : `${charge}`;
+  const cLoStr = isNaN(chargeMin) ? '?' : (chargeMin >= 0 ? `+${chargeMin}` : `${chargeMin}`);
+  const cHiStr = isNaN(chargeMax) ? '?' : (chargeMax >= 0 ? `+${chargeMax}` : `${chargeMax}`);
 
-  let lines = [
-    'Design a peptide with the following properties:',
-    '',
-    'BIOLOGICAL ACTIVITIES:',
-    actLines,
-    '',
-    'PHYSICOCHEMICAL REQUIREMENTS:',
-    `- Exact length: ${length} amino acids`,
-    `- Net charge: ${chargeStr}`,
-    `- Average hydrophobicity (Kyte-Doolittle): ${hydro}`,
-    '',
-    'STRICT RULES:',
-    '1. Use ONLY standard single-letter amino acid codes: ACDEFGHIKLMNPQRSTVWY',
-    '2. No modifications, numbers, spaces, or non-standard characters',
-    '3. Output ONLY the sequence — nothing else',
-  ];
-
-  const ref = document.getElementById('inputRef').value.trim();
-  if (ref) lines.push('', `Reference sequence available for scoring: ${ref}`);
-
-  return lines.join('\n');
+  return [
+    `Generate one ${actStr} peptide meeting ALL of:`,
+    `- Length: between ${lenMin} and ${lenMax} amino acids`,
+    `- Net charge: between ${cLoStr} and ${cHiStr}`,
+    `- Hydrophobic residues (L,I,V,F,W,M,A): between ${hydroMin}% and ${hydroMax}%`,
+    `- Alphabet: standard amino acids only (A C D E F G H I K L M N P Q R S T V W Y)`,
+    ``,
+    `Output: one line, uppercase letters only, nothing else.`,
+    `Sequence:`,
+  ].join('\n');
 }
 
 function updatePreview() {
+  if (customMode) return;
   document.getElementById('promptPreview').value = buildPromptText();
 }
 
-/* ── Quick-start presets ──────────────────────────────────────────────────── */
+/* ── Quick-start presets ─────────────────────────────────────────────────── */
 function applyPreset(name) {
+  if (customMode) toggleCustomMode();   // switch back to structured form
   clearActivities();
+
   if (name === 'antimicrobial') {
-    document.getElementById('inputLength').value = 20;
-    document.getElementById('inputCharge').value = 3;
-    document.getElementById('inputHydro').value  = 0.5;
+    document.getElementById('inputLenMin').value    = 15;
+    document.getElementById('inputLenMax').value    = 20;
+    document.getElementById('inputChargeMin').value = 2;
+    document.getElementById('inputChargeMax').value = 5;
+    document.getElementById('inputHydroMin').value  = 35;
+    document.getElementById('inputHydroMax').value  = 55;
     setActivity('anti-bacterial', true);
     setActivity('anti-fungal', true);
   } else if (name === 'cpp') {
-    document.getElementById('inputLength').value = 15;
-    document.getElementById('inputCharge').value = 5;
-    document.getElementById('inputHydro').value  = 0.3;
+    document.getElementById('inputLenMin').value    = 12;
+    document.getElementById('inputLenMax').value    = 16;
+    document.getElementById('inputChargeMin').value = 4;
+    document.getElementById('inputChargeMax').value = 8;
+    document.getElementById('inputHydroMin').value  = 30;
+    document.getElementById('inputHydroMax').value  = 50;
     setActivity('drug-delivery', true);
   }
   updatePreview();
@@ -124,11 +173,15 @@ function clearActivities() {
 }
 
 function clearForm() {
-  document.getElementById('inputLength').value  = 12;
-  document.getElementById('inputCharge').value  = 5;
-  document.getElementById('inputHydro').value   = 0.5;
-  document.getElementById('inputRetries').value = 6;
-  document.getElementById('inputRef').value     = '';
+  if (customMode) toggleCustomMode();
+  document.getElementById('inputLenMin').value    = 15;
+  document.getElementById('inputLenMax').value    = 20;
+  document.getElementById('inputChargeMin').value = 2;
+  document.getElementById('inputChargeMax').value = 5;
+  document.getElementById('inputHydroMin').value  = 35;
+  document.getElementById('inputHydroMax').value  = 55;
+  document.getElementById('inputRetries').value   = 6;
+  document.getElementById('inputRef').value       = '';
   clearActivities();
   resetResults();
   updatePreview();
@@ -156,38 +209,61 @@ function setStatus(ok) {
 let eventSource = null;
 
 async function generate() {
-  if (eventSource) {
-    eventSource.close();
-    eventSource = null;
+  if (eventSource) { eventSource.close(); eventSource = null; }
+
+  let body;
+
+  if (customMode) {
+    const promptText = document.getElementById('promptPreview').value.trim();
+    if (!promptText) {
+      alert('Please write a prompt in the text area first.');
+      return;
+    }
+    const retries = parseInt(document.getElementById('inputRetriesCustom').value) || 6;
+    body = {
+      prompt_override: promptText,
+      activities: [],
+      max_retries: retries,
+      threshold: 0.35,
+    };
+  } else {
+    const lenMin    = parseInt(document.getElementById('inputLenMin').value);
+    const lenMax    = parseInt(document.getElementById('inputLenMax').value);
+    const chargeMin = parseFloat(document.getElementById('inputChargeMin').value);
+    const chargeMax = parseFloat(document.getElementById('inputChargeMax').value);
+    const hydroMin  = parseFloat(document.getElementById('inputHydroMin').value);
+    const hydroMax  = parseFloat(document.getElementById('inputHydroMax').value);
+    const retries   = parseInt(document.getElementById('inputRetries').value);
+    const ref       = document.getElementById('inputRef').value.trim() || null;
+
+    if (isNaN(lenMin) || isNaN(lenMax) || lenMin < 2 || lenMax < lenMin) {
+      alert('Please enter a valid length range (min ≥ 2, max ≥ min).');
+      return;
+    }
+    if (isNaN(chargeMin) || isNaN(chargeMax) || chargeMax < chargeMin) {
+      alert('Please enter a valid charge range (max ≥ min).');
+      return;
+    }
+
+    body = {
+      length_min: lenMin,
+      length_max: lenMax,
+      charge_min: chargeMin,
+      charge_max: chargeMax,
+      hydro_min: isNaN(hydroMin) ? undefined : hydroMin,
+      hydro_max: isNaN(hydroMax) ? undefined : hydroMax,
+      activities: [...activeActivities],
+      reference: ref,
+      max_retries: retries,
+      threshold: 0.35,
+    };
   }
-
-  const length   = parseInt(document.getElementById('inputLength').value);
-  const charge   = parseFloat(document.getElementById('inputCharge').value);
-  const hydro    = parseFloat(document.getElementById('inputHydro').value);
-  const retries  = parseInt(document.getElementById('inputRetries').value);
-  const ref      = document.getElementById('inputRef').value.trim() || null;
-
-  if (isNaN(length) || length < 2) {
-    alert('Please enter a valid length (min 2).');
-    return;
-  }
-
-  const body = {
-    length,
-    charge,
-    hydrophobicity: hydro,
-    activities: [...activeActivities],
-    reference: ref,
-    max_retries: retries,
-    threshold: 0.35,
-  };
 
   resetResults();
   setGenerating(true);
   clearTrace();
 
   try {
-    // POST the request and get SSE back
     const response = await fetch(`${API_BASE}/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -203,18 +279,14 @@ async function generate() {
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
 
-      // Process SSE lines
       const lines = buffer.split('\n');
-      buffer = lines.pop(); // keep incomplete line
+      buffer = lines.pop();
 
       for (const line of lines) {
         if (line.startsWith('data: ')) {
           const raw = line.slice(6).trim();
           if (!raw || raw === '[DONE]') continue;
-          try {
-            const evt = JSON.parse(raw);
-            handleEvent(evt);
-          } catch { /* skip malformed */ }
+          try { handleEvent(JSON.parse(raw)); } catch { /* skip malformed */ }
         }
       }
     }
@@ -263,13 +335,12 @@ function addTraceRow(evt) {
     : '—';
   const bleuStr = evt.score != null ? evt.score.toFixed(4) : '–';
   const rbStr   = evt.rulebook_score != null ? evt.rulebook_score.toFixed(2) : '–';
-  const statusIcon = evt.passed ? '✓' : '✗';
   const statusWord = evt.passed ? 'PASS' : (evt.sequence ? 'FAIL' : 'ERR');
 
   const row = document.createElement('div');
-  row.className = `trace-row ${evt.passed ? 'pass' : 'fail'}`;
+  row.className = `trace-row ${evt.passed ? 'pass' : (evt.sequence ? 'fail' : 'error')}`;
   row.innerHTML =
-    `<span class="trace-status">${statusIcon}</span>` +
+    `<span class="trace-status">${evt.passed ? '✓' : '✗'}</span>` +
     `Attempt ${evt.n}: ${seqPreview} | BLEU: ${bleuStr} | RB: ${rbStr} | ${statusWord}`;
 
   list.appendChild(row);
@@ -280,7 +351,6 @@ function renderResult(result) {
   const score = result.score;
   const rb    = result.rulebook_score;
 
-  // Sequence display
   const seqEl = document.getElementById('resultSequence');
   seqEl.textContent = seq || 'No sequence generated';
   const displayScore = score != null ? score : rb;
@@ -288,21 +358,18 @@ function renderResult(result) {
     seqEl.className = 'result-sequence ' + scoreClass(displayScore);
   }
 
-  // PeptideBLEU badge
   if (score != null) {
     document.getElementById('bleuValue').textContent = score.toFixed(4);
     document.getElementById('metricBleu').className =
       'metric-badge metric-bleu ' + scoreClass(score);
   }
 
-  // Rulebook fitness badge
   if (rb != null) {
     document.getElementById('rbScoreValue').textContent = rb.toFixed(4);
     document.getElementById('metricRulebook').className =
       'metric-badge metric-rulebook ' + scoreClass(rb);
   }
 
-  // Reference note
   const refNote = document.getElementById('refNote');
   if (result.reference_used && result.reference_used.startsWith('default:')) {
     const preset = result.reference_used.split(':')[1];

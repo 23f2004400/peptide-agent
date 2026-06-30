@@ -12,7 +12,7 @@ from typing import Optional
 from . import models
 from .rulebook import validate_sequence, rulebook_score
 from .peptide_bleu import peptide_metric, score_components, ACTIVITY_WEIGHTS
-from .prompt_builder import build_prompt, get_system_prompt, build_feedback_entry
+from .prompt_builder import build_prompt, get_system_prompt, build_feedback_entry, _resolve_charge
 from .trace_logger import TraceLogger
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ VALID_AAS_SET = set("ACDEFGHIKLMNPQRSTVWY")
 # substring of this that the model echoes back would be a false positive.
 CANONICAL_AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
 
-VALID_AA_RE = re.compile(r'[ACDEFGHIKLMNPQRSTVWY]{5,}')
+VALID_AA_RE = re.compile(r'[ACDEFGHIKLMNPQRSTVWY]{4,}')
 
 # ── Reference peptide pools ──────────────────────────────────────────────────
 # Multiple validated references per preset. Stored as (seq, charge, avg_kd_hydro).
@@ -53,6 +53,7 @@ _AMP_REFS = [
     ("GIGKFLKKAKKFGKAFVKILKK", +6, +0.3),  # Magainin-2 (22 AA)
     ("KLLKLLKLWKK",            +5, +0.9),  # Short AMP (11 AA)
     ("FLGALFKALSHLL",          +2, +1.6),  # Helical AMP (13 AA)
+    ("ALWKTMLKKLGTMALHAGKA",   +4, +0.2),  # Dermaseptin-S1 1-20 (20 AA, charge +4, 50% hydrophobic)
 ]
 _SIGNAL_REFS = [
     ("MSVPTQVLGLLLLWLTDARC", 0, +1.2),   # IgK signal (20 AA)
@@ -148,13 +149,43 @@ class PeptideAgent:
         raw_stripped = raw.strip()
         upper = raw_stripped.upper()
 
+        # Strip model prefixes that appear before the sequence
+        _PREFIXES = (
+            "SEQUENCE:", "ANSWER:", "ASSISTANT:", "OUTPUT:",
+            "THE SEQUENCE IS", "GENERATED SEQUENCE:",
+        )
+        for pfx in _PREFIXES:
+            if upper.startswith(pfx):
+                cut = len(pfx)
+                upper = upper[cut:].strip()
+                raw_stripped = raw_stripped[cut:].strip()
+                break
+
         # Priority 1: a line that IS the sequence (only AA chars, nothing else)
+        # Also accepts lines where stripping punctuation/spaces yields a clean sequence.
         for line in upper.split('\n'):
             line = line.strip().strip('"\'`*_-| ')
+            if not line:
+                continue
             if len(line) >= 5 and all(c in VALID_AAS_SET for c in line):
                 if line not in CANONICAL_AA_ALPHABET:
                     logger.debug("extract: pure-line match %r", line)
+                    if target_length and len(line) > target_length:
+                        line = line[:target_length]
                     return line
+            # Also accept if stripping non-AA chars from the EDGES only yields a clean
+            # sequence — handles trailing punctuation like "KLLKLL." or "KLLKLL,".
+            # We strip edges only (not middle) to avoid extracting from English text.
+            edge_stripped = re.sub(
+                r'^[^ACDEFGHIKLMNPQRSTVWY]+|[^ACDEFGHIKLMNPQRSTVWY]+$', '', line
+            )
+            if (len(edge_stripped) >= 5
+                    and edge_stripped not in CANONICAL_AA_ALPHABET
+                    and all(c in VALID_AAS_SET for c in edge_stripped)):
+                logger.debug("extract: edge-stripped match %r -> %r", line, edge_stripped)
+                if target_length and len(edge_stripped) > target_length:
+                    edge_stripped = edge_stripped[:target_length]
+                return edge_stripped
 
         # Priority 2: collapse dash-separated notation (A-C-D-E → ACDE)
         dash_collapsed = re.sub(
@@ -191,6 +222,20 @@ class PeptideAgent:
                 candidates.append(match_str)
 
         if not candidates:
+            # Primer-prefix fallback: scan from pos 0 collecting uppercase valid-AA chars
+            # until the first non-AA or lowercase char. Catches cases like "KFLKThe..." → "KFLKT".
+            prefix: list[str] = []
+            for ch in raw_stripped:
+                if ch.isupper() and ch in VALID_AAS_SET:
+                    prefix.append(ch)
+                else:
+                    break
+            if len(prefix) >= 4:
+                result = ''.join(prefix)
+                if target_length and len(result) > target_length:
+                    result = result[:target_length]
+                logger.debug("extract: primer-prefix fallback %r", result)
+                return result
             return ""
 
         logger.debug("extract: %d candidate(s): %s", len(candidates), candidates)
@@ -222,7 +267,7 @@ class PeptideAgent:
         activities  = task.get('activities', [])
         reference   = task.get('reference', '') or ''
         target_length = task.get('length', 12)
-        target_charge = task.get('charge', 0)
+        target_charge = _resolve_charge(task)
         activity_preset = self._resolve_activity_preset(activities)
 
         # Choose reference: user-supplied > activity-specific best-fit > none
@@ -245,16 +290,21 @@ class PeptideAgent:
         # Primer forces the model to continue with AA letters instead of prose.
         # The assistant turn already starts with these chars, so the model
         # cannot begin with "Explanation:" or other preambles.
-        _PRIMERS = {'amp': 'KLL', 'cpp': 'RKK', 'signal': 'MSV', 'immunological': 'GIL'}
+        _PRIMERS = {'amp': 'KFLK', 'cpp': 'RKK', 'signal': 'MSV', 'immunological': 'GIL'}
         assistant_primer = _PRIMERS.get(activity_preset or '', 'KL')
 
         feedback_history: list[dict] = []
-        best_result: Optional[AgentResult] = None
+        best_passing_result: Optional[AgentResult] = None   # rulebook-valid, by score
+        best_overall_result: Optional[AgentResult] = None   # any sequence, by score
         trace: list[dict] = []
         trace_log = TraceLogger(task)
 
         for attempt_num in range(1, max_retries + 1):
-            prompt = build_prompt(task, feedback_history)
+            # First attempt: use custom prompt if provided, else build from task.
+            if attempt_num == 1 and task.get('prompt_override'):
+                prompt = task['prompt_override']
+            else:
+                prompt = build_prompt(task, feedback_history)
             system = get_system_prompt()
             trace_log.log_prompt(attempt_num, prompt)
 
@@ -346,23 +396,32 @@ class PeptideAgent:
             if on_attempt:
                 on_attempt(log)
 
-            # Track best result: highest PeptideBLEU first, tie-break on rulebook score
+            # Track best results: prefer a rulebook-valid sequence (best_passing_result)
+            # but also keep best by score regardless of validity (best_overall_result).
             cur_bleu = score if score is not None else -1.0
-            best_bleu = best_result.score if best_result is not None else -1.0
-            if (best_result is None
-                    or cur_bleu > best_bleu
-                    or (cur_bleu == best_bleu and rb_score > best_result.rulebook_score)):
-                best_result = AgentResult(
-                    sequence=seq,
-                    score=score if score is not None else 0.0,
-                    rulebook_score=rb_score,
-                    components=comp,
-                    rulebook=validation,
-                    iterations=attempt_num,
-                    trace=trace[:],
-                    time_seconds=round(time.time() - t0, 2),
-                    reference_used=reference_used,
-                )
+            cur_result = AgentResult(
+                sequence=seq,
+                score=score if score is not None else 0.0,
+                rulebook_score=rb_score,
+                components=comp,
+                rulebook=validation,
+                iterations=attempt_num,
+                trace=trace[:],
+                time_seconds=round(time.time() - t0, 2),
+                reference_used=reference_used,
+            )
+            overall_bleu = best_overall_result.score if best_overall_result is not None else -1.0
+            if (best_overall_result is None
+                    or cur_bleu > overall_bleu
+                    or (cur_bleu == overall_bleu and rb_score > best_overall_result.rulebook_score)):
+                best_overall_result = cur_result
+
+            if validation['valid']:
+                passing_bleu = best_passing_result.score if best_passing_result is not None else -1.0
+                if (best_passing_result is None
+                        or cur_bleu > passing_bleu
+                        or (cur_bleu == passing_bleu and rb_score > best_passing_result.rulebook_score)):
+                    best_passing_result = cur_result
 
             if passed:
                 logger.info("[A%d] threshold met — stopping early", attempt_num)
@@ -376,19 +435,7 @@ class PeptideAgent:
                 )
                 break
 
-            # Build rich feedback for the next attempt
             fb = build_feedback_entry(seq, score, validation, task)
-            # Add physics feedback even when rulebook passes but score is low
-            if validation['valid'] and score is not None and score < threshold:
-                net_c  = validation['net_charge']
-                avg_h  = validation['hydrophobicity']
-                tgt_c  = task.get('charge')
-                tgt_h  = task.get('hydrophobicity')
-                if tgt_c is not None and abs(net_c - tgt_c) > 1:
-                    # fix_hints already set by build_feedback_entry
-                    pass
-                if tgt_h is not None and abs(avg_h - tgt_h) > 0.3:
-                    pass
             feedback_history.append(fb)
 
             # Build next iteration's prompt now (while feedback is fresh) so we
@@ -410,6 +457,8 @@ class PeptideAgent:
 
         elapsed = round(time.time() - t0, 2)
 
+        # Prefer rulebook-valid result; fall back to best-by-score overall.
+        best_result = best_passing_result or best_overall_result
         if best_result is None:
             last = trace[-1] if trace else {}
             last_val = last.get('rulebook', {})

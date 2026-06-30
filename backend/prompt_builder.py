@@ -4,21 +4,6 @@ Dynamic prompt builder with feedback injection for iterative refinement.
 
 from __future__ import annotations
 
-# Amino acid charge cheat sheet injected into every prompt so the model can
-# reason about charge without knowing biochemistry conventions.
-_CHARGE_REF = (
-    "Charge reference: K=+1, R=+1, H=+1, D=-1, E=-1; all others = 0"
-)
-
-# Hydrophobicity bucket guide (Kyte-Doolittle ranges, simplified)
-_HYDRO_REF = (
-    "Hydrophobicity guide: "
-    "very hydrophobic (>2): I,V,L,F,C,M,A,W,Y  |  "
-    "neutral (~0): G,T,S,P  |  "
-    "hydrophilic (<-1): H,Q,N,D,E,K,R"
-)
-
-# Human-readable activity names for the prompt
 _ACTIVITY_LABELS = {
     "anti-bacterial": "antimicrobial (AMP)",
     "anti-fungal": "antifungal (AMP)",
@@ -42,149 +27,140 @@ BASE_SYSTEM = (
 )
 
 
-# Multiple candidate examples per preset so retries rotate through different ones.
-# Each example has a different amino acid composition — model won't always copy the same one.
-_AMP_EXAMPLES = [
-    "GIGKFLKKAKKFGKAF",   # magainin-like, charge +5
-    "KLNKSGLKSFLVATS",   # charge +3, ~40% hydrophobic
-    "KFLKLFVKASHLLVS",   # charge +3, amphipathic
-    "KLLKLLKLWKKLSAL",   # charge +4, strong AMP
-]
-_CPP_EXAMPLES = [
-    "RKKRKLLLKRKLLLK",
-    "GRKKRRQRRRPQKLK",
-    "KALAKALAKALAKAL",
-]
-_SIGNAL_EXAMPLES = [
-    "MSVPTQVLGLLLLWL",
-    "MKFLILLFNILCLFP",
-]
-_IMMUNO_EXAMPLES = [
-    "SIINFEKLFGILGFV",
-    "GILGFVFTLKLFLKL",
-]
+def _resolve_charge(task: dict) -> float:
+    """Support both 'charge' (frontend) and 'ref_net_charge' (eval dataset) keys."""
+    if 'charge' in task:
+        return float(task['charge'])
+    return float(task.get('ref_net_charge', 0))
 
 
-def _get_example(activities: list[str], length: int, attempt: int = 0) -> str:
-    if "drug-delivery" in activities or "cell-cell-communication" in activities:
-        pool = _CPP_EXAMPLES
-    elif any(a in activities for a in ("anti-bacterial", "anti-fungal", "anti-viral", "anti-cancer")):
-        pool = _AMP_EXAMPLES
-    elif "signal-peptide" in activities:
-        pool = _SIGNAL_EXAMPLES
-    elif "immunological" in activities:
-        pool = _IMMUNO_EXAMPLES
+def _resolve_hydro_pct(task: dict) -> int | None:
+    """
+    Return target hydrophobicity as a percentage (0-100), or None if not specified.
+    """
+    if 'ref_hydrophobic_pct' in task:
+        return int(task['ref_hydrophobic_pct'])
+    if 'hydrophobicity' in task:
+        kd = float(task['hydrophobicity'])
+        return max(10, min(80, int(30 + kd * 20)))
+    return None
+
+
+def _get_ranges(task: dict) -> tuple[int, int, int, int, int, int]:
+    """
+    Return (len_lo, len_hi, charge_lo, charge_hi, hydro_lo, hydro_hi).
+    Prefers explicit range params; falls back to computing ±tolerance from single values.
+    """
+    length = task.get('length', 12)
+
+    # Length range
+    len_lo = int(task['length_min']) if 'length_min' in task else max(1, length - 2)
+    len_hi = int(task['length_max']) if 'length_max' in task else length + 2
+
+    # Charge range
+    if 'charge_min' in task and 'charge_max' in task:
+        charge_lo = int(task['charge_min'])
+        charge_hi = int(task['charge_max'])
     else:
-        pool = _AMP_EXAMPLES
-    base = pool[attempt % len(pool)]
-    return (base + "KLKLKLKLKLKLKLKL")[:length]
+        c = int(round(_resolve_charge(task)))
+        charge_lo = c - 1
+        charge_hi = c + 1
+
+    # Hydrophobic % range
+    if 'hydro_min' in task and 'hydro_max' in task:
+        hydro_lo = int(task['hydro_min'])
+        hydro_hi = int(task['hydro_max'])
+    else:
+        pct = _resolve_hydro_pct(task) or 40
+        hydro_lo = max(0, pct - 15)
+        hydro_hi = min(100, pct + 15)
+
+    return len_lo, len_hi, charge_lo, charge_hi, hydro_lo, hydro_hi
+
+
+def _initial_prompt(task: dict, feedback_history: list[dict] | None = None) -> str:
+    length = task.get('length', 12)
+    activities = task.get('activities', [])
+    act_labels = [_ACTIVITY_LABELS.get(a, a) for a in activities]
+    act_str = ", ".join(act_labels) if act_labels else "general"
+
+    len_lo, len_hi, charge_lo, charge_hi, hydro_lo, hydro_hi = _get_ranges(task)
+
+    charge_lo_str = f"{charge_lo:+d}"
+    charge_hi_str = f"{charge_hi:+d}"
+
+    # Build terse inline correction hints from the most recent attempt that had issues.
+    # Bracket notes like "[use fewer K/R]" steer residue choice without triggering
+    # OpenBioLLM's comprehension/prose mode (which a full retry block always triggers).
+    charge_note = ""
+    hydro_note = ""
+    if feedback_history:
+        for fb in reversed(feedback_history):
+            if fb.get('seq') and fb.get('fix_hints'):
+                for hint in fb['fix_hints']:
+                    h = hint.lower()
+                    if 'charge' in h and not charge_note:
+                        charge_note = (" [use fewer K/R]"
+                                       if ('add d or e' in h or 'replace' in h)
+                                       else " [use more K/R/H]")
+                    if 'hydrophob' in h and not hydro_note:
+                        hydro_note = (" [add more L/F/I/V/M]"
+                                      if 'add l' in h
+                                      else " [use fewer L/I/V/F/W/M]")
+                break
+
+    return (
+        f"Generate one {act_str} peptide meeting ALL of:\n"
+        f"- Length: between {len_lo} and {len_hi} amino acids\n"
+        f"- Net charge: between {charge_lo_str} and {charge_hi_str}{charge_note}\n"
+        f"- Hydrophobic residues (L,I,V,F,W,M,A): between {hydro_lo}% and {hydro_hi}%{hydro_note}\n"
+        f"- Alphabet: standard amino acids only (A C D E F G H I K L M N P Q R S T V W Y)\n"
+        f"\n"
+        f"Output: one line, uppercase letters only, nothing else.\n"
+        f"Sequence:"
+    )
 
 
 def build_prompt(task: dict, feedback_history: list[dict] | None = None) -> str:
-    length     = task.get('length', 12)
-    charge     = task.get('charge', 0)
-    hydro      = task.get('hydrophobicity', 0.0)
-    activities = task.get('activities', [])
-
-    hydro_pct   = max(10, min(80, int(30 + hydro * 20)))
-    act_labels  = [_ACTIVITY_LABELS.get(a, a) for a in activities]
-    act_str     = ", ".join(act_labels) if act_labels else "general"
-    charge_sign = f"+{int(charge)}" if charge >= 0 else str(int(charge))
-    attempt     = len(feedback_history) if feedback_history else 0
-    example     = _get_example(activities, length, attempt)
-
-    if not feedback_history:
-        return (
-            f"Generate a {length}-residue {act_str} peptide sequence.\n"
-            f"Net charge {charge_sign} (K=+1, R=+1, H=+1, D=-1, E=-1). "
-            f"About {hydro_pct}% hydrophobic residues (L,I,V,F,W,M,A,Y,C are hydrophobic).\n"
-            f"Output only uppercase amino acid letters on one line.\n"
-            f"Example: {example}\n"
-            f"Sequence:"
-        )
-
-    # Retry — minimal, direct; avoid commentary language that triggers explanation mode
-    prev     = feedback_history[-1]
-    prev_seq = prev.get('seq') or ''
-    issues   = prev.get('issues', [])
-    hints    = prev.get('fix_hints', [])
-
-    lines = [
-        f"{length}-residue {act_str} peptide, charge {charge_sign}, "
-        f"~{hydro_pct}% hydrophobic (K=+1,R=+1,D=-1,E=-1). Output: {example}",
-    ]
-
-    if prev_seq and len(prev_seq) >= 5 and prev_seq == prev_seq.upper():
-        lines.append(f"Avoid: {prev_seq}")
-        for hint in hints[:2]:
-            lines.append(f"Instead: {hint}")
-
-    lines.append("Sequence:")
-    return "\n".join(lines)
-
-
-def _charge_hints(actual: float, target: float) -> list[str]:
-    """Return actionable amino-acid substitution hints to correct charge."""
-    diff = target - actual
-    hints = []
-    if diff > 1:
-        n = int(round(diff))
-        hints.append(
-            f"Add ~{n} positively charged residues: replace some neutral AA with K (lysine) or R (arginine)"
-        )
-        hints.append("Remove any D (aspartate) or E (glutamate) if present — they subtract charge")
-    elif diff < -1:
-        n = int(round(-diff))
-        hints.append(
-            f"Reduce positive charge by {n}: replace some K/R with neutral AA (A, L, V, G, S)"
-        )
-        hints.append("Or add D (aspartate) / E (glutamate) to lower net charge")
-    return hints
-
-
-def _hydro_hints(actual: float, target: float) -> list[str]:
-    """Return actionable hydrophobicity correction hints."""
-    diff = target - actual
-    hints = []
-    if diff > 0.3:
-        hints.append(
-            "Hydrophobicity too low: replace some K/R/D/E/N/Q with hydrophobic residues L, I, V, F, W, or Y"
-        )
-    elif diff < -0.3:
-        hints.append(
-            "Hydrophobicity too high: replace some L/I/V/F/W with polar residues K, R, S, N, Q, or E"
-        )
-    return hints
+    return _initial_prompt(task, feedback_history)
 
 
 def build_feedback_entry(seq: str, score, validation: dict, task: dict) -> dict:
-    """
-    Build a rich feedback dict with fix hints for the next prompt iteration.
-    Call this instead of building the dict inline in agent.py.
-    """
-    issues = list(validation.get('issues', []))
+    """Build a feedback dict with plain-English per-axis failure summaries."""
+    issues: list[str] = list(validation.get('issues', []))
     fix_hints: list[str] = []
 
-    # Charge hints
-    actual_c = validation.get('net_charge', 0)
-    target_c = task.get('charge')
-    if target_c is not None and abs(actual_c - target_c) > 1:
-        fix_hints.extend(_charge_hints(actual_c, target_c))
+    len_lo, len_hi, charge_lo, charge_hi, hydro_lo, hydro_hi = _get_ranges(task)
 
-    # Hydrophobicity hints
-    actual_h = validation.get('hydrophobicity', 0.0)
-    target_h = task.get('hydrophobicity')
-    if target_h is not None and abs(actual_h - target_h) > 0.3:
-        fix_hints.extend(_hydro_hints(actual_h, target_h))
+    actual_charge    = int(round(float(validation.get('net_charge', 0))))
+    actual_hydro_pct = float(validation.get('hydro_percent', 0.0))
+    actual_len       = validation.get('length', len(seq))
 
-    # Length hint
-    actual_len = validation.get('length', len(seq))
-    target_len = task.get('length')
-    if target_len is not None and abs(actual_len - target_len) > 2:
-        if actual_len < target_len:
-            fix_hints.append(f"Too short ({actual_len} AA): add {target_len - actual_len} more residues")
+    if not (charge_lo <= actual_charge <= charge_hi):
+        direction = "add K or R residues" if actual_charge < charge_lo else "add D or E residues, or replace some K/R with L, I, V, or A"
+        fix_hints.append(
+            f"Charge was {actual_charge:+d}, needs {charge_lo:+d} to {charge_hi:+d} — {direction}"
+        )
+
+    if not (hydro_lo <= actual_hydro_pct <= hydro_hi):
+        if actual_hydro_pct < hydro_lo:
+            direction = "add L, I, V, F, W, M, or A residues"
         else:
-            fix_hints.append(f"Too long ({actual_len} AA): remove {actual_len - target_len} residues")
+            direction = "replace some L/I/V/F/W/M/A with K, R, S, N, or Q"
+        fix_hints.append(
+            f"Hydrophobic fraction was {actual_hydro_pct:.0f}%, "
+            f"needs {hydro_lo}% to {hydro_hi}% — {direction}"
+        )
+
+    if not (len_lo <= actual_len <= len_hi):
+        if actual_len < len_lo:
+            fix_hints.append(
+                f"Length was {actual_len}, needs {len_lo} to {len_hi} — add more residues"
+            )
+        else:
+            fix_hints.append(
+                f"Length was {actual_len}, needs {len_lo} to {len_hi} — remove some residues"
+            )
 
     return {
         'seq': seq,

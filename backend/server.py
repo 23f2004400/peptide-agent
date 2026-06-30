@@ -44,6 +44,14 @@ app.add_middleware(
 # ── Request / Response models ────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
+    # Range-based inputs (preferred — sent by the new frontend form)
+    length_min: int | None = Field(None, ge=2, le=200)
+    length_max: int | None = Field(None, ge=2, le=200)
+    charge_min: float | None = None
+    charge_max: float | None = None
+    hydro_min: float | None = None   # hydrophobic % 0-100
+    hydro_max: float | None = None   # hydrophobic % 0-100
+    # Legacy single-value fallbacks (still accepted for eval scripts)
     length: int = Field(12, ge=2, le=200)
     charge: float = 0.0
     hydrophobicity: float = 0.0
@@ -62,6 +70,16 @@ async def _generate_stream(req: GenerateRequest) -> AsyncIterator[dict]:
     task = req.model_dump()
     if req.reference is None:
         task['reference'] = ''
+
+    # When range params are provided, derive single-value equivalents used by
+    # reference selection and the assistant primer logic in agent.py.
+    if req.length_min is not None and req.length_max is not None:
+        task['length'] = req.length_max          # size max_tokens conservatively
+    if req.charge_min is not None and req.charge_max is not None:
+        task['charge'] = (req.charge_min + req.charge_max) / 2
+    if req.hydro_min is not None and req.hydro_max is not None:
+        task['ref_hydrophobic_pct'] = int((req.hydro_min + req.hydro_max) / 2)
+        task.pop('hydrophobicity', None)
 
     loop = asyncio.get_event_loop()
     attempt_queue: asyncio.Queue = asyncio.Queue()

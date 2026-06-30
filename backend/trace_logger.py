@@ -166,10 +166,14 @@ class TraceLogger:
         prompt = self._pending_prompt
         raw    = self._pending_raw
 
-        # Task targets
+        # Task targets — support both frontend keys and eval-dataset keys
         tgt_len    = task.get("length", "?")
-        tgt_charge = task.get("charge", 0)
-        tgt_hydro  = task.get("hydrophobicity", 0.0)
+        tgt_charge = task.get("charge") if "charge" in task else task.get("ref_net_charge", 0)
+        tgt_hydro  = (
+            task.get("hydrophobicity", 0.0)
+            if "hydrophobicity" in task
+            else task.get("ref_hydrophobic_pct", 0.0)
+        )
         activities = task.get("activities", [])
 
         # Actual measured properties
