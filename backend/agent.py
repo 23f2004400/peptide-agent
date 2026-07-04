@@ -290,7 +290,7 @@ class PeptideAgent:
         # Primer forces the model to continue with AA letters instead of prose.
         # The assistant turn already starts with these chars, so the model
         # cannot begin with "Explanation:" or other preambles.
-        _PRIMERS = {'amp': 'KFLK', 'cpp': 'RKK', 'signal': 'MSV', 'immunological': 'GIL'}
+        _PRIMERS = {'amp': 'ALWK', 'cpp': 'RKK', 'signal': 'MSV', 'immunological': 'GIL'}
         assistant_primer = _PRIMERS.get(activity_preset or '', 'KL')
 
         feedback_history: list[dict] = []

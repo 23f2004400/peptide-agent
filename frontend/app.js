@@ -62,11 +62,12 @@ function toggleCustomMode() {
   if (customMode) {
     preview.readOnly = false;
     preview.style.color = 'var(--text-primary)';
-    preview.placeholder = 'Write your peptide specification here...\n\nExample:\nGenerate one antimicrobial peptide meeting ALL of:\n- Length: between 15 and 20 amino acids\n- Net charge: between +2 and +5\n- Hydrophobic residues (L,I,V,F,W,M,A): between 35% and 55%\n- Alphabet: standard amino acids only\n\nOutput: one line, uppercase letters only.\nSequence:';
+    preview.placeholder = 'Write your peptide specification here...\n\nExample:\nGenerate one antimicrobial peptide meeting ALL of:\n- Length: between 15 and 20 amino acids\n- Net charge: between +2 and +5\n- Hydrophobic fraction: between 35% and 55%\n- Alphabet: standard amino acids only\n\nOutput: one line, uppercase letters only.\nSequence:';
     preview.value = '';
     hint.style.display = 'block';
-    form.style.display = 'none';
-    controls.style.display = 'block';
+    // Keep the form visible so the user can still set ranges for validation
+    form.style.display = 'block';
+    controls.style.display = 'none';
     badge.textContent = 'CUSTOM';
     badge.style.background = 'rgba(59,130,246,0.2)';
     badge.style.color = '#60a5fa';
@@ -115,8 +116,8 @@ function buildPromptText() {
     `Generate one ${actStr} peptide meeting ALL of:`,
     `- Length: between ${lenMin} and ${lenMax} amino acids`,
     `- Net charge: between ${cLoStr} and ${cHiStr}`,
-    `- Hydrophobic residues (L,I,V,F,W,M,A): between ${hydroMin}% and ${hydroMax}%`,
-    `- Alphabet: standard amino acids only (A C D E F G H I K L M N P Q R S T V W Y)`,
+    `- Hydrophobic fraction: between ${hydroMin}% and ${hydroMax}%`,
+    `- Alphabet: 20 standard amino acids only`,
     ``,
     `Output: one line, uppercase letters only, nothing else.`,
     `Sequence:`,
@@ -141,7 +142,6 @@ function applyPreset(name) {
     document.getElementById('inputHydroMin').value  = 35;
     document.getElementById('inputHydroMax').value  = 55;
     setActivity('anti-bacterial', true);
-    setActivity('anti-fungal', true);
   } else if (name === 'cpp') {
     document.getElementById('inputLenMin').value    = 12;
     document.getElementById('inputLenMax').value    = 16;
@@ -219,12 +219,26 @@ async function generate() {
       alert('Please write a prompt in the text area first.');
       return;
     }
-    const retries = parseInt(document.getElementById('inputRetriesCustom').value) || 6;
+    const lenMin    = parseInt(document.getElementById('inputLenMin').value);
+    const lenMax    = parseInt(document.getElementById('inputLenMax').value);
+    const chargeMin = parseFloat(document.getElementById('inputChargeMin').value);
+    const chargeMax = parseFloat(document.getElementById('inputChargeMax').value);
+    const hydroMin  = parseFloat(document.getElementById('inputHydroMin').value);
+    const hydroMax  = parseFloat(document.getElementById('inputHydroMax').value);
+    const retries   = parseInt(document.getElementById('inputRetries').value) || 6;
+    const ref       = document.getElementById('inputRef').value.trim() || null;
     body = {
       prompt_override: promptText,
-      activities: [],
+      activities: [...activeActivities],
       max_retries: retries,
       threshold: 0.35,
+      length_min: isNaN(lenMin) ? 15 : lenMin,
+      length_max: isNaN(lenMax) ? 20 : lenMax,
+      charge_min: isNaN(chargeMin) ? 0 : chargeMin,
+      charge_max: isNaN(chargeMax) ? 5 : chargeMax,
+      hydro_min: isNaN(hydroMin) ? undefined : hydroMin,
+      hydro_max: isNaN(hydroMax) ? undefined : hydroMax,
+      reference: ref,
     };
   } else {
     const lenMin    = parseInt(document.getElementById('inputLenMin').value);

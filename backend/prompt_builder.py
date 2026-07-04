@@ -100,9 +100,9 @@ def _initial_prompt(task: dict, feedback_history: list[dict] | None = None) -> s
                 for hint in fb['fix_hints']:
                     h = hint.lower()
                     if 'charge' in h and not charge_note:
-                        charge_note = (" [use fewer K/R]"
-                                       if ('add d or e' in h or 'replace' in h)
-                                       else " [use more K/R/H]")
+                        charge_note = (" [replace K/R with A/L/V]"
+                                       if ('replace' in h)
+                                       else " [add K for charge]")
                     if 'hydrophob' in h and not hydro_note:
                         hydro_note = (" [add more L/F/I/V/M]"
                                       if 'add l' in h
@@ -113,8 +113,8 @@ def _initial_prompt(task: dict, feedback_history: list[dict] | None = None) -> s
         f"Generate one {act_str} peptide meeting ALL of:\n"
         f"- Length: between {len_lo} and {len_hi} amino acids\n"
         f"- Net charge: between {charge_lo_str} and {charge_hi_str}{charge_note}\n"
-        f"- Hydrophobic residues (L,I,V,F,W,M,A): between {hydro_lo}% and {hydro_hi}%{hydro_note}\n"
-        f"- Alphabet: standard amino acids only (A C D E F G H I K L M N P Q R S T V W Y)\n"
+        f"- Hydrophobic residues: between {hydro_lo}% and {hydro_hi}%{hydro_note}\n"
+        f"- Alphabet: 20 standard amino acids only\n"
         f"\n"
         f"Output: one line, uppercase letters only, nothing else.\n"
         f"Sequence:"
@@ -137,7 +137,7 @@ def build_feedback_entry(seq: str, score, validation: dict, task: dict) -> dict:
     actual_len       = validation.get('length', len(seq))
 
     if not (charge_lo <= actual_charge <= charge_hi):
-        direction = "add K or R residues" if actual_charge < charge_lo else "add D or E residues, or replace some K/R with L, I, V, or A"
+        direction = "add K residues" if actual_charge < charge_lo else "replace some K/R with A, L, V, or I"
         fix_hints.append(
             f"Charge was {actual_charge:+d}, needs {charge_lo:+d} to {charge_hi:+d} — {direction}"
         )
