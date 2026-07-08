@@ -123,7 +123,7 @@ class AgentResult:
     reference_used: str = ''
 
 
-class PeptideAgent:
+class PepForgeAgent:
     def __init__(
         self,
         gateway_url: str | None = None,

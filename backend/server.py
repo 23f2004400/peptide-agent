@@ -29,10 +29,10 @@ from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel, Field
 
-from backend.agent import PeptideAgent, AgentResult, AttemptLog
+from backend.agent import PepForgeAgent, AgentResult, AttemptLog
 from backend import models
 
-app = FastAPI(title="Peptide Generation Agent API", version="1.0.0")
+app = FastAPI(title="PepForge API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,7 +104,7 @@ async def _generate_stream(req: GenerateRequest) -> AsyncIterator[dict]:
             }
         )
 
-    agent = PeptideAgent(
+    agent = PepForgeAgent(
         threshold=req.threshold,
         max_retries=req.max_retries,
     )

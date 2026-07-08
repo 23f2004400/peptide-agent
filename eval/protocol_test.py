@@ -1,6 +1,6 @@
 """
 Ad-hoc test: run the agent against a supervisor-specified generation task,
-applying a custom iteration/stop rule that differs from PeptideAgent's own:
+applying a custom iteration/stop rule that differs from PepForgeAgent's own:
 
     1. Generate a candidate sequence.
     2. Compute its PeptideBLEU score.
@@ -9,7 +9,7 @@ applying a custom iteration/stop rule that differs from PeptideAgent's own:
        at least 0.02, terminate and return the best sequence.
     5. Cap total iterations at 10 regardless.
 
-PeptideAgent.generate() has its own early-stop logic (threshold + N-gram/
+PepForgeAgent.generate() has its own early-stop logic (threshold + N-gram/
 BLOSUM floor), so this script runs the agent with an unreachable threshold
 to force it through all 10 iterations, then replays the supervisor's exact
 stop rule as post-processing over the per-iteration trace. No changes to
@@ -28,7 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-from backend.agent import PeptideAgent
+from backend.agent import PepForgeAgent
 
 TASK = {
     'length': 25,
@@ -64,7 +64,7 @@ def apply_stop_rule(trace: list[dict]) -> tuple[str, int, float]:
 
 
 def main():
-    agent = PeptideAgent(threshold=TASK['threshold'], max_retries=TASK['max_retries'])
+    agent = PepForgeAgent(threshold=TASK['threshold'], max_retries=TASK['max_retries'])
     result = agent.generate(TASK)
 
     print("Per-iteration trace:")

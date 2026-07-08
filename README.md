@@ -1,4 +1,4 @@
-# Peptide Generation Agent
+# PepForge
 
 An agentic iterative refinement system for novel peptide sequence design using OpenBioLLM-8B. Built for the IIIT-Delhi research internship to demonstrate that a feedback-driven agent loop beats a plain LLM baseline on the PeptideBLEU metric.
 
@@ -20,7 +20,7 @@ User request (length, charge, hydrophobicity, activities)
         │
         ▼
 ┌─────────────────────────────────────────────────────┐
-│                  PeptideAgent loop                  │
+│                  PepForgeAgent loop                 │
 │                                                     │
 │  Attempt 1 (temp=0.1)                               │
 │    ├─ build_prompt(task)                            │

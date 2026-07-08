@@ -1,5 +1,5 @@
 """
-Batch evaluation: compare plain LLM baseline vs PeptideAgent.
+Batch evaluation: compare plain LLM baseline vs PepForgeAgent.
 
 Usage:
   python run_eval.py --mode baseline --n 1000 --output results_baseline.json
@@ -149,14 +149,14 @@ def run_agent(
     max_retries: int = 3,
     threshold: float = 0.35,
 ) -> dict:
-    """Run the PeptideAgent on a sample of tasks."""
-    from backend.agent import PeptideAgent
+    """Run the PepForgeAgent on a sample of tasks."""
+    from backend.agent import PepForgeAgent
 
     print(f"\n[AGENT] Loading tasks from {raw_gen_path} ...")
     records = _load_raw_generations(raw_gen_path)[:n]
     print(f"[AGENT] Running agent on {len(records)} tasks (max_retries={max_retries}) ...")
 
-    agent = PeptideAgent(threshold=threshold, max_retries=max_retries)
+    agent = PepForgeAgent(threshold=threshold, max_retries=max_retries)
     all_scores = []
     comp_sums = {k: 0.0 for k in COMPONENT_KEYS}
     results = []
