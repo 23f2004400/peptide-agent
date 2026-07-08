@@ -37,6 +37,12 @@ CANONICAL_AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
 
 VALID_AA_RE = re.compile(r'[ACDEFGHIKLMNPQRSTVWY]{4,}')
 
+# Minimum acceptable N-gram/BLOSUM62 scores for an attempt to be considered
+# "passed" — prevents the loop from stopping early on aggregate score alone
+# while residue ordering/motif similarity to the reference is still poor.
+NGRAM_FLOOR = 0.35
+BLOSUM_FLOOR = 0.35
+
 # ── Reference peptide pools ──────────────────────────────────────────────────
 # Multiple validated references per preset. Stored as (seq, charge, avg_kd_hydro).
 # The agent picks the one with charge and length closest to the task target.
@@ -376,7 +382,12 @@ class PeptideAgent:
                 score = None
 
             issues = validation['issues']
-            passed = validation['valid'] and (score is None or score >= threshold)
+            ref_floor_ok = (
+                not effective_reference
+                or (comp.get('ngram_bleu', 1.0) >= NGRAM_FLOOR
+                    and comp.get('blosum', 1.0) >= BLOSUM_FLOOR)
+            )
+            passed = validation['valid'] and (score is None or score >= threshold) and ref_floor_ok
 
             logger.info(
                 "[A%d] seq=%s len=%d charge=%+d hydro=%.2f rb=%.2f bleu=%s passed=%s",
@@ -435,7 +446,10 @@ class PeptideAgent:
                 )
                 break
 
-            fb = build_feedback_entry(seq, score, validation, task)
+            fb = build_feedback_entry(
+                seq, score, validation, task,
+                comp=comp, reference=effective_reference,
+            )
             feedback_history.append(fb)
 
             # Build next iteration's prompt now (while feedback is fresh) so we

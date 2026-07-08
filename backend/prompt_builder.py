@@ -125,7 +125,8 @@ def build_prompt(task: dict, feedback_history: list[dict] | None = None) -> str:
     return _initial_prompt(task, feedback_history)
 
 
-def build_feedback_entry(seq: str, score, validation: dict, task: dict) -> dict:
+def build_feedback_entry(seq: str, score, validation: dict, task: dict,
+                          comp: dict | None = None, reference: str = '') -> dict:
     """Build a feedback dict with plain-English per-axis failure summaries."""
     issues: list[str] = list(validation.get('issues', []))
     fix_hints: list[str] = []
@@ -160,6 +161,16 @@ def build_feedback_entry(seq: str, score, validation: dict, task: dict) -> dict:
         else:
             fix_hints.append(
                 f"Length was {actual_len}, needs {len_lo} to {len_hi} — remove some residues"
+            )
+
+    if reference and comp:
+        if comp.get('ngram_bleu', 1.0) < 0.5:
+            fix_hints.append(
+                f"Try incorporating a fragment similar to '{reference[:4]}' seen in related peptides"
+            )
+        if comp.get('blosum', 1.0) < 0.5:
+            fix_hints.append(
+                f"Use residues chemically similar to the reference motif '{reference[:6]}'"
             )
 
     return {
