@@ -43,6 +43,12 @@ VALID_AA_RE = re.compile(r'[ACDEFGHIKLMNPQRSTVWY]{4,}')
 NGRAM_FLOOR = 0.35
 BLOSUM_FLOOR = 0.35
 
+# Extra same-prompt tries when the model's completion degenerates into the
+# assistant primer plus noise (garbage/foreign-script continuation) instead of
+# a real sequence — catches "non-empty but useless" completions that the
+# EMPTY_RETRY_ATTEMPTS check in models.py can't see (it only retries on 0 tokens).
+INTERNAL_SHORT_RETRY_ATTEMPTS = 2
+
 # ── Reference peptide pools ──────────────────────────────────────────────────
 # Multiple validated references per preset. Stored as (seq, charge, avg_kd_hydro).
 # The agent picks the one with charge and length closest to the task target.
@@ -316,12 +322,48 @@ class PeptideAgent:
 
             logger.debug("[A%d] prompt (first 200 chars): %s", attempt_num, prompt[:200])
 
+            degenerate_floor = max(5, target_length // 2)
+            raw, seq = '', ''
             try:
-                raw = models.generate(
-                    prompt, system=system,
-                    assistant_primer=assistant_primer,
-                    max_tokens=target_length + 5,
-                )
+                for internal_try in range(1 + INTERNAL_SHORT_RETRY_ATTEMPTS):
+                    raw = models.generate(
+                        prompt, system=system,
+                        assistant_primer=assistant_primer,
+                        max_tokens=target_length + 5,
+                    )
+                    if not raw:
+                        continue
+                    seq = self.extract_sequence(raw, target_length)
+                    if seq and len(seq) > target_length:
+                        seq = seq[:target_length]
+                    if seq and len(seq) >= degenerate_floor:
+                        break
+                    logger.debug(
+                        "[A%d] internal retry %d/%d: degenerate extraction (len=%d, raw=%r)",
+                        attempt_num, internal_try + 1, INTERNAL_SHORT_RETRY_ATTEMPTS,
+                        len(seq or ''), raw[:60],
+                    )
+                else:
+                    # All hint-augmented tries were degenerate — fall back to the
+                    # plain, hint-free prompt shape that reliably works better
+                    # (hint text appears to be a destabilizing factor for this
+                    # chat_template-less deployment; see CLAUDE.md known issues).
+                    clean_prompt = build_prompt(task, [])
+                    fallback_raw = models.generate(
+                        clean_prompt, system=system,
+                        assistant_primer=assistant_primer,
+                        max_tokens=target_length + 5,
+                    )
+                    if fallback_raw:
+                        fallback_seq = self.extract_sequence(fallback_raw, target_length)
+                        if fallback_seq and len(fallback_seq) > target_length:
+                            fallback_seq = fallback_seq[:target_length]
+                        logger.debug(
+                            "[A%d] clean-prompt fallback: len=%d, raw=%r",
+                            attempt_num, len(fallback_seq or ''), fallback_raw[:60],
+                        )
+                        if fallback_seq and len(fallback_seq) >= degenerate_floor:
+                            raw, seq = fallback_raw, fallback_seq
             except Exception as exc:
                 logger.warning("[A%d] LLM call raised: %s", attempt_num, exc)
                 trace_log.log_llm_error(attempt_num, exc)
@@ -351,10 +393,6 @@ class PeptideAgent:
                 feedback_history.append({'seq': '', 'score': None, 'issues': log.issues, 'fix_hints': []})
                 continue
 
-            seq = self.extract_sequence(raw, target_length)
-            # Trim to target length if model overshot (stop=["\n"] doesn't bound length)
-            if seq and len(seq) > target_length:
-                seq = seq[:target_length]
             if not seq:
                 logger.warning("[A%d] extraction failed. Raw: %r", attempt_num, raw[:80])
                 trace_log.log_extraction_failure(attempt_num, raw)
@@ -446,9 +484,20 @@ class PeptideAgent:
                 )
                 break
 
+            # Anchor next iteration's feedback on the best candidate seen so far,
+            # not this attempt — otherwise a regression's issues steer the next
+            # retry instead of the actual gaps still open in the best sequence.
+            cur_is_best = best_overall_result is None or cur_bleu >= best_overall_result.score
+            if cur_is_best:
+                anchor_seq, anchor_score = seq, score
+                anchor_validation, anchor_comp = validation, comp
+            else:
+                anchor_seq, anchor_score = best_overall_result.sequence, best_overall_result.score
+                anchor_validation, anchor_comp = best_overall_result.rulebook, best_overall_result.components
+
             fb = build_feedback_entry(
-                seq, score, validation, task,
-                comp=comp, reference=effective_reference,
+                anchor_seq, anchor_score, anchor_validation, task,
+                comp=anchor_comp, reference=effective_reference,
             )
             feedback_history.append(fb)
 
