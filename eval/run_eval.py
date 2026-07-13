@@ -151,6 +151,7 @@ def run_agent(
 ) -> dict:
     """Run the PepForgeAgent on a sample of tasks."""
     from backend.agent import PepForgeAgent
+    from backend.esmfold_scorer import get_plddt
 
     print(f"\n[AGENT] Loading tasks from {raw_gen_path} ...")
     records = _load_raw_generations(raw_gen_path)[:n]
@@ -190,6 +191,10 @@ def run_agent(
         for k in COMPONENT_KEYS:
             comp_sums[k] += comps.get(k, 0.0)
 
+        # pLDDT scoring — additive only, computed once on the final sequence,
+        # never affects generation/retry logic. Never raises.
+        plddt = get_plddt(result.sequence) if result.sequence else {}
+
         results.append({
             'task_id': rec.get('task_id', i),
             'reference': ref,
@@ -199,6 +204,8 @@ def run_agent(
             'iterations': result.iterations,
             'time_seconds': result.time_seconds,
             'trace': result.trace,
+            'plddt_score': plddt.get('mean_plddt'),
+            'plddt_passes': plddt.get('passes', False),
         })
 
         if (i + 1) % 50 == 0:
@@ -217,6 +224,13 @@ def run_agent(
         json.dump(summary, f, indent=2)
 
     _print_summary(summary)
+
+    plddt_col = [r.get('plddt_score') for r in results if r.get('plddt_score') is not None]
+    if plddt_col:
+        passes = sum(1 for r in results if r.get('plddt_passes'))
+        print(f"  Avg pLDDT:           {sum(plddt_col)/len(plddt_col):.1f}")
+        print(f"  pLDDT pass (>=70):   {passes}/{len(results)}")
+
     print(f"\n[AGENT] Written to {output_path}")
     return summary
 

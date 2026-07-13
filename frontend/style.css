@@ -408,6 +408,30 @@ body { display: flex; min-height: 100vh; }
   text-align: right;
 }
 
+/* ── 3D structure viewer ─────────────────────────────────────────────────── */
+.pdb-download-btn {
+  margin-left: auto;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.04em;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.pdb-download-btn:hover { border-color: var(--cyan-dim); color: var(--cyan); }
+.structure-viewer {
+  width: 100%;
+  height: 320px;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #000;
+  position: relative;
+}
+
 /* ── Loading spinner ─────────────────────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinner {

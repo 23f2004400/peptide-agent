@@ -21,6 +21,8 @@ const COMPONENT_LABELS = {
 /* ── State ───────────────────────────────────────────────────────────────── */
 let activeActivities = new Set();
 let customMode = false;   // true = free-text prompt mode
+let currentPdb = null;    // raw PDB text for the last successful structure prediction
+let structureViewer = null;
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 function init() {
@@ -330,8 +332,13 @@ function resetResults() {
   document.getElementById('timeValue').textContent  = '–';
   document.getElementById('metricBleu').className   = 'metric-badge metric-bleu';
   document.getElementById('metricRulebook').className = 'metric-badge metric-rulebook';
+  document.getElementById('metricPlddt').style.display = 'none';
   document.getElementById('refNote').textContent = '';
   document.getElementById('componentCard').style.display = 'none';
+  document.getElementById('structureCard').style.display = 'none';
+  currentPdb = null;
+  structureViewer = null;
+  document.getElementById('structureViewer').innerHTML = '';
 }
 
 function clearTrace() {
@@ -398,12 +405,90 @@ function renderResult(result) {
   document.getElementById('timeValue').textContent = result.time_seconds != null
     ? result.time_seconds.toFixed(1) + 's' : '–';
 
+  renderPlddt(result.plddt_score, result.plddt_confidence);
+  renderStructure(result.plddt_pdb);
+
   if (result.components && Object.keys(result.components).length > 0) {
-    renderComponents(result.components);
+    renderComponents(result.components, result.plddt_score);
   }
 }
 
-function renderComponents(comp) {
+/* pLDDT (ESMFold) structural confidence — additive, alongside PeptideBLEU/rulebook */
+const PLDDT_COLORS = {
+  very_high: { color: '#00e5c3', label: 'Very High' },
+  high:      { color: '#3b82f6', label: 'Confident' },
+  low:       { color: '#fbbf24', label: 'Low' },
+  very_low:  { color: '#ef4444', label: 'Very Low' },
+  unknown:   { color: '#64748b', label: 'N/A' },
+};
+
+function renderPlddt(score, confidence) {
+  const badge = document.getElementById('metricPlddt');
+  const valueEl = document.getElementById('plddtValue');
+  if (score == null) {
+    badge.style.display = 'none';
+    return;
+  }
+  const style = PLDDT_COLORS[confidence] || PLDDT_COLORS.unknown;
+  valueEl.textContent = `${score.toFixed(1)}  ${style.label}`;
+  valueEl.style.color = style.color;
+  badge.style.display = '';
+}
+
+/* 3D structure (ESMFold PDB) — embedded 3Dmol.js viewer + raw-file download */
+function renderStructure(pdbText) {
+  const card = document.getElementById('structureCard');
+  currentPdb = pdbText || null;
+
+  if (!pdbText) {
+    card.style.display = 'none';
+    return;
+  }
+
+  const container = document.getElementById('structureViewer');
+  container.innerHTML = '';
+
+  if (typeof $3Dmol === 'undefined') {
+    container.innerHTML = '<div class="trace-empty">3Dmol.js failed to load (check network/CDN access)</div>';
+    card.style.display = 'block';
+    return;
+  }
+
+  structureViewer = $3Dmol.createViewer(container, { backgroundColor: '#000000' });
+  structureViewer.addModel(pdbText, 'pdb');
+  // Color by pLDDT (stored in the B-factor column by ESMFold), same bands as the badge.
+  structureViewer.setStyle({}, {
+    cartoon: {
+      colorfunc: (atom) => {
+        const b = atom.b;
+        if (b >= 90) return '#00e5c3';
+        if (b >= 70) return '#3b82f6';
+        if (b >= 50) return '#fbbf24';
+        return '#ef4444';
+      },
+    },
+  });
+  structureViewer.zoomTo();
+  structureViewer.render();
+
+  card.style.display = 'block';
+}
+
+function downloadPdb() {
+  if (!currentPdb) return;
+  const blob = new Blob([currentPdb], { type: 'chemical/x-pdb' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const seq = document.getElementById('resultSequence').textContent.trim();
+  a.download = `${seq || 'structure'}.pdb`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function renderComponents(comp, plddtScore) {
   const card = document.getElementById('componentCard');
   const container = document.getElementById('componentScores');
   container.innerHTML = '';
@@ -427,6 +512,21 @@ function renderComponents(comp) {
     `;
     container.appendChild(row);
   });
+
+  // pLDDT is on a 0-100 scale (not 0-1 like the other components) — shown
+  // separately since it's a structural metric, not a PeptideBLEU component.
+  if (plddtScore != null) {
+    const row = document.createElement('div');
+    row.className = 'comp-row';
+    row.innerHTML = `
+      <span class="comp-label">pLDDT (ESMFold)</span>
+      <div class="comp-bar-bg">
+        <div class="comp-bar-fill" style="width:${Math.round(plddtScore)}%"></div>
+      </div>
+      <span class="comp-val">${plddtScore.toFixed(1)}</span>
+    `;
+    container.appendChild(row);
+  }
 
   card.style.display = 'block';
 }

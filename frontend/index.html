@@ -7,6 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Inter:wght@300;400;500;600&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="style.css" />
+  <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
 </head>
 <body>
   <!-- SIDEBAR -->
@@ -200,6 +201,10 @@
             <span class="metric-label">Rulebook</span>
             <span class="metric-value" id="rbScoreValue">0.0000</span>
           </div>
+          <div class="metric-badge" id="metricPlddt" style="display:none">
+            <span class="metric-label">pLDDT (ESMFold)</span>
+            <span class="metric-value" id="plddtValue">–</span>
+          </div>
           <div class="metric-badge" id="metricIter">
             <span class="metric-label">Iterations</span>
             <span class="metric-value" id="iterValue">–</span>
@@ -229,6 +234,16 @@
             COMPONENT SCORES
           </div>
           <div id="componentScores" class="component-scores"></div>
+        </div>
+
+        <!-- 3D Structure (ESMFold) -->
+        <div class="result-card" id="structureCard" style="display:none">
+          <div class="result-card-header">
+            <span class="result-icon">🧬</span>
+            3D STRUCTURE (ESMFold)
+            <button class="pdb-download-btn" id="btnDownloadPdb" onclick="downloadPdb()">⬇ Download PDB</button>
+          </div>
+          <div id="structureViewer" class="structure-viewer"></div>
         </div>
       </section>
     </div>

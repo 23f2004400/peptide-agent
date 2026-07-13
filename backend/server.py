@@ -145,6 +145,30 @@ async def _generate_stream(req: GenerateRequest) -> AsyncIterator[dict]:
                 "time_seconds": r.time_seconds,
             }
         }
+
+        # pLDDT scoring — additive only, computed once on the final sequence,
+        # never affects generation/retry logic. Never raises. Run off the
+        # event loop since get_plddt() does a blocking HTTP call (up to ~60s).
+        try:
+            from .esmfold_scorer import get_plddt
+            if r.sequence:
+                plddt = await loop.run_in_executor(executor, get_plddt, r.sequence)
+                final["result"]["plddt_score"]      = plddt.get("mean_plddt")
+                final["result"]["plddt_confidence"] = plddt.get("confidence")
+                final["result"]["plddt_passes"]     = plddt.get("passes", False)
+                final["result"]["plddt_interp"]     = plddt.get("interpretation")
+                final["result"]["plddt_pdb"]        = plddt.get("pdb")
+            else:
+                final["result"]["plddt_score"] = final["result"]["plddt_confidence"] = None
+                final["result"]["plddt_passes"] = False
+                final["result"]["plddt_interp"] = "No sequence generated"
+                final["result"]["plddt_pdb"] = None
+        except Exception:
+            final["result"]["plddt_score"] = final["result"]["plddt_confidence"] = None
+            final["result"]["plddt_passes"] = False
+            final["result"]["plddt_interp"] = "pLDDT scoring unavailable"
+            final["result"]["plddt_pdb"] = None
+
         yield {"data": json.dumps(final)}
 
 

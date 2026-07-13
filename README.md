@@ -53,19 +53,21 @@ The **key differentiator** is feedback injection: each retry explicitly tells th
 peptide-agent/
 ├── backend/
 │   ├── __init__.py
-│   ├── agent.py           # Core agent loop (generate → score → retry)
+│   ├── agent.py           # Core agent loop (generate → score → retry), PepForgeAgent
 │   ├── models.py          # OpenBioLLM connection via OpenAI-compat vLLM API
 │   ├── peptide_bleu.py    # PeptideBLEU v1.2 scoring (7 components)
 │   ├── rulebook.py        # Amino acid property validation (7 rules)
 │   ├── prompt_builder.py  # Dynamic prompt + feedback injection
+│   ├── trace_logger.py    # Human-readable per-iteration trace → logs/generation_trace.log
+│   ├── esmfold_scorer.py  # Optional pLDDT structural confidence via ESMFold HF API
 │   └── server.py          # FastAPI server + SSE streaming
 ├── frontend/
 │   ├── index.html         # Single-page app
 │   ├── app.js             # SSE client, live prompt preview, result rendering
 │   └── style.css          # Dark theme (#0d1117), JetBrains Mono
 ├── eval/
-│   └── run_eval.py        # Batch evaluation (baseline vs agent comparison)
-├── .env.example
+│   ├── run_eval.py        # Batch evaluation (baseline vs agent comparison)
+│   └── protocol_test.py   # Single-task run with a custom stop rule, as a template
 ├── requirements.txt
 └── README.md
 ```
@@ -89,11 +91,7 @@ pip install -r requirements.txt
 
 ### 3. Configure environment
 
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
+Create a `.env` file in the project root (not checked in):
 
 ```env
 GATEWAY_URL=https://gotten-governance-troops-sheer.trycloudflare.com/v1
@@ -101,6 +99,7 @@ API_KEY=sk-bhaskera-alice
 MODEL_NAME=aaditya/OpenBioLLM-Llama3-8B
 THRESHOLD=0.35
 MAX_RETRIES=3
+HF_TOKEN=   # optional — raises HuggingFace Inference API rate limits for pLDDT scoring
 ```
 
 > **Note:** The Cloudflare tunnel URL expires when the server restarts. Update `GATEWAY_URL` in `.env` each time.
@@ -172,8 +171,10 @@ Valid activity flags: `anti-bacterial`, `anti-cancer`, `anti-fungal`, `anti-para
 ```
 data: {"type": "attempt", "n": 1, "sequence": "KLLRLLKRLL", "score": 0.31, "status": "fail", "issues": [...]}
 data: {"type": "attempt", "n": 2, "sequence": "KLLRKLKRLL", "score": 0.39, "status": "pass", "issues": []}
-data: {"type": "final", "result": {"sequence": "KLLRKLKRLL", "score": 0.39, "components": {...}, "iterations": 2, "time_seconds": 4.2}}
+data: {"type": "final", "result": {"sequence": "KLLRKLKRLL", "score": 0.39, "components": {...}, "iterations": 2, "time_seconds": 4.2, "plddt_score": 78.3, "plddt_confidence": "high", "plddt_passes": true, "plddt_interp": "Confident — reliable backbone predicted"}}
 ```
+
+`plddt_score` is `null` (and `plddt_confidence`/`plddt_interp` explain why) when no sequence was generated or the ESMFold API call failed — pLDDT scoring never blocks or fails the `/generate` response itself.
 
 ### `GET /health`
 
@@ -224,6 +225,25 @@ Every generated sequence passes through 7 validation rules before scoring:
 7. **Activity constraints** — e.g., `drug-delivery` requires charge +3 to +9; `signal-peptide` requires 15–30 aa
 
 Validation issues are fed back into the next attempt prompt with specific residue suggestions.
+
+---
+
+## Structural confidence (pLDDT / ESMFold)
+
+Supplementary to PeptideBLEU. After the agent returns its final sequence, `backend/esmfold_scorer.py` calls the ESMFold structure-prediction model (`facebook/esmfold_v1`) via the HuggingFace Inference API and reports mean pLDDT (predicted Local Distance Difference Test, Lin et al. 2023, *Science* 379:1123–1130) as a structural-foldability signal, separate from sequence similarity:
+
+| pLDDT | Confidence | Interpretation |
+|-------|-----------|-----------------|
+| ≥ 90 | `very_high` | Excellent — well-folded peptide |
+| 70–90 | `high` | Confident — reliable backbone predicted |
+| 50–70 | `low` | Low — possibly flexible or disordered |
+| < 50 | `very_low` | Likely intrinsically disordered |
+
+This is purely additive and read-only with respect to generation:
+- Computed **once**, on the final sequence, **after** `PepForgeAgent.generate()` returns — it never influences retries, the pass/fail decision, or `NGRAM_FLOOR`/`BLOSUM_FLOOR`.
+- `get_plddt()` never raises — on any failure (invalid sequence, timeout, non-200 response, HF model cold-start) it returns a dict with `error` set and `mean_plddt: None`, so a down/rate-limited ESMFold endpoint never breaks generation.
+- Optional `HF_TOKEN` in `.env` raises the HF Inference API's free-tier rate limit; omitting it still works, just with a lower ceiling and possible `503` cold-start waits (handled with backoff, up to 3 attempts).
+- Surfaced in the `/generate` SSE final event (`plddt_score`, `plddt_confidence`, `plddt_passes`, `plddt_interp`), the frontend results panel (badge + component-scores bar), and optionally in `eval/run_eval.py --mode agent` output (`plddt_score`/`plddt_passes` per result, plus an average/pass-rate summary line) — each call there is a live, serial HTTP request per task, so it noticeably slows down large `--n` eval runs.
 
 ---
 
@@ -318,9 +338,9 @@ The browser interface at `localhost:8080` matches the research demo screenshot:
 
 - **Left sidebar** — Quick-start presets (Antimicrobial, Cell-Penetrating), model/provider/status
 - **Peptide Specification panel** — Live prompt preview (updates as you type), property inputs, activity checkboxes, optional reference sequence
-- **Results panel** — Real-time execution trace (SSE-streamed per attempt), final sequence with colour-coded score, 7-component score bars
+- **Results panel** — Real-time execution trace (SSE-streamed per attempt), final sequence with colour-coded score, 7-component score bars, plus an optional pLDDT badge and component-scores row when structural scoring succeeds
 
-Score colour coding: green ≥ 0.35 (above threshold), amber 0.25–0.35, red < 0.25.
+Score colour coding: green ≥ 0.35 (above threshold), amber 0.25–0.35, red < 0.25. pLDDT badge colour coding: teal ≥ 90 (Very High), blue 70–90 (Confident), amber 50–70 (Low), red < 50 (Very Low).
 
 ---
 
@@ -329,7 +349,8 @@ Score colour coding: green ≥ 0.35 (above threshold), amber 0.25–0.35, red < 
 | Problem | Fix |
 |---------|-----|
 | Status dot red | Check `GATEWAY_URL` in `.env` — tunnel may have expired |
-| `GATEWAY_URL not set` error | Run `cp .env.example .env` and fill in the URL |
+| `GATEWAY_URL not set` error | Create `.env` in the project root and fill in the URL (see Setup) |
 | Sequence extraction fails | Model returned prose — the regex will pick the longest valid AA run; if empty, check the model is responding |
 | Score always 0 | No reference sequence provided — PeptideBLEU requires a ground-truth sequence |
 | `ModuleNotFoundError` | Run server from the `peptide-agent/` directory, not from `backend/` |
+| pLDDT badge never appears / `plddt_score` always `null` | ESMFold HF endpoint cold-starting, rate-limited, or unreachable — check `plddt_interp` in the response for the specific reason; generation itself is unaffected |
