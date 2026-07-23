@@ -161,6 +161,8 @@ class TraceLogger:
         reference_used: str,
         threshold: float,
         next_prompt: str = "",
+        mode: str = "",
+        weakest: str = "",
     ) -> None:
         ts     = _now()
         prompt = self._pending_prompt
@@ -233,6 +235,7 @@ class TraceLogger:
             f"  Hydrophobicity: {tgt_hydro:.2f}",
             f"  Activity Flags: {activities}",
             f"  Reference:      {effective_reference or '(none)'}  [{reference_used}]",
+            f"  Mode:           {mode or '(unspecified)'}" + (f"  (targeting: {weakest})" if weakest else ""),
             "",
             "PROMPT SENT TO MODEL",
             prompt or "(none cached)",

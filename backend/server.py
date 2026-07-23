@@ -101,6 +101,9 @@ async def _generate_stream(req: GenerateRequest) -> AsyncIterator[dict]:
                 "passed": log.passed,
                 "components": log.components,
                 "rulebook": log.rulebook,
+                "mode": log.mode,
+                "weakest": log.weakest,
+                "delta_score": log.delta_score,
             }
         )
 

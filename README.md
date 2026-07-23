@@ -7,9 +7,9 @@ An agentic iterative refinement system for novel peptide sequence design using O
 | Model | Score |
 |-------|-------|
 | OpenBioLLM-8B best-of-5 (baseline) | 0.3784 |
-| SmolLM2-360M best-of-5 (baseline) | 0.3885 |
-| Gemma-3-1b best-of-5 (baseline) | 0.3898 |
-| **This agent (target)** | **0.42+** |
+| SmolLM2-360M best-of-5 (baseline)  | 0.3885 |
+| Gemma-3-1b best-of-5 (baseline)    | 0.3898 |
+| **This agent (target)**            | **0.42+** |
 
 ---
 

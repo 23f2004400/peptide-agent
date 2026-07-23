@@ -346,6 +346,32 @@ function clearTrace() {
     '<div class="trace-empty">Generating…</div>';
 }
 
+/* Generate/edit mode badges — additive alongside the existing PASS/FAIL/ERR trace rows */
+const MODE_BADGES = {
+  generate:            { label: 'GENERATE',          color: '#64748b' },
+  llm_edit:            { label: null /* + weakest */, color: '#3b82f6' },
+  deterministic:       { label: 'EDIT det',          color: '#00e5c3' },
+  edit_explored:       { label: null /* + weakest */, color: '#fbbf24' },
+  edit_stuck:          { label: 'edit_stuck',        color: '#64748b' },
+  generate_degenerate: { label: 'generate_degen',    color: '#ef4444' },
+};
+
+function modeBadgeHtml(mode, weakest) {
+  if (!mode) return '';
+  const cfg = MODE_BADGES[mode];
+  if (!cfg) return '';
+  const prefix = mode === 'edit_explored' ? 'explored' : 'EDIT';
+  const label = cfg.label || `${prefix} ${weakest || ''}`.trim();
+  return `<span class="mode-badge" style="color:${cfg.color};border-color:${cfg.color}">${label}</span>`;
+}
+
+function deltaHtml(delta) {
+  if (delta == null) return '';
+  if (delta > 0) return `<span class="delta-badge delta-up">+${delta.toFixed(4)} ↑</span>`;
+  if (delta < 0) return `<span class="delta-badge delta-down">${delta.toFixed(4)} ↓</span>`;
+  return `<span class="delta-badge delta-same">±0.0000 →</span>`;
+}
+
 function addTraceRow(evt) {
   const list = document.getElementById('traceList');
   const empty = list.querySelector('.trace-empty');
@@ -362,7 +388,9 @@ function addTraceRow(evt) {
   row.className = `trace-row ${evt.passed ? 'pass' : (evt.sequence ? 'fail' : 'error')}`;
   row.innerHTML =
     `<span class="trace-status">${evt.passed ? '✓' : '✗'}</span>` +
-    `Attempt ${evt.n}: ${seqPreview} | BLEU: ${bleuStr} | RB: ${rbStr} | ${statusWord}`;
+    modeBadgeHtml(evt.mode, evt.weakest) +
+    `Attempt ${evt.n}: ${seqPreview} | BLEU: ${bleuStr} | RB: ${rbStr} | ${statusWord}` +
+    (evt.sequence ? deltaHtml(evt.delta_score) : '');
 
   list.appendChild(row);
 }

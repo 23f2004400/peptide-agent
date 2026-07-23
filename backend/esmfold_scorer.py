@@ -67,7 +67,9 @@ def get_plddt(sequence: str) -> dict:
                 data=seq,
                 timeout=60,
             )
-            if resp.status_code in (429, 503):
+            if resp.status_code in (429, 503, 504):
+                # 504 (gateway timeout) is common on this free endpoint under
+                # load — transient, same backoff-and-retry as 429/503.
                 time.sleep(min(5 * (attempt + 1), 30))
                 continue
             if resp.status_code == 200:
