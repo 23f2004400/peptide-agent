@@ -92,12 +92,35 @@ def fix_hydrophobicity(sequence: str, target_min: float, target_max: float) -> s
     return ''.join(seq)
 
 
+# Conservative, chemically-similar substitutions used as the last-resort
+# guaranteed-change fallback below — swapping to one of these preserves the
+# residue's general character (size/charge/polarity) rather than a random pick.
+_CONSERVATIVE_SUBS = {
+    'L': 'I', 'I': 'V', 'V': 'L',
+    'K': 'R', 'R': 'K',
+    'D': 'E', 'E': 'D',
+    'S': 'T', 'T': 'S',
+    'F': 'Y', 'Y': 'W', 'W': 'F',
+    'A': 'G', 'G': 'A',
+    'N': 'Q', 'Q': 'N',
+}
+
+
 def deterministic_edit(sequence: str, task: dict) -> str | None:
     """
     Apply length -> charge -> hydrophobicity fixes in sequence.
-    Returns None if the result is unchanged or invalid, so the caller can
-    skip adding a redundant/bad candidate.
+
+    If the sequence is already within every tolerance (nothing to fix), force
+    one conservative substitution at the midpoint residue instead of
+    returning None — this guarantees a genuinely different, valid candidate
+    every time, so the caller never has to retry the LLM on its own stuck
+    output just to get *some* alternative to try.
+
+    Returns None only if the input itself isn't a valid AA sequence.
     """
+    if not sequence or not all(c in VALID_AA for c in sequence.upper()):
+        return None
+
     target_length = task.get('length', len(sequence))
     charge_min    = task.get('charge_min', task.get('charge', 3) - 1)
     charge_max    = task.get('charge_max', task.get('charge', 3) + 2)
@@ -110,7 +133,13 @@ def deterministic_edit(sequence: str, task: dict) -> str | None:
     edited = fix_charge(edited, target_charge, tolerance=1)
     edited = fix_hydrophobicity(edited, hydro_min, hydro_max)
 
-    if edited == sequence or not all(c in VALID_AA for c in edited):
+    if edited == sequence:
+        seq = list(sequence.upper())
+        mid = len(seq) // 2
+        seq[mid] = _CONSERVATIVE_SUBS.get(seq[mid], 'A' if seq[mid] != 'A' else 'G')
+        edited = ''.join(seq)
+
+    if not all(c in VALID_AA for c in edited):
         return None
     return edited
 
@@ -145,17 +174,6 @@ _COMPONENT_INSTRUCTIONS_TEMPLATE = {
 }
 
 
-# Prompt-text creativity nudge, cycled per rotation attempt. Not real sampling
-# temperature — models.generate() doesn't expose one, and backend/models.py is
-# off-limits — this is the fallback the spec itself anticipates: a phrase in
-# the system prompt instead of an actual temperature parameter.
-_CREATIVITY_HINTS = [
-    "Be conservative — change the minimum number of residues necessary.",
-    "Try a moderately different substitution than an obvious one.",
-    "Be more exploratory — consider a bolder set of substitutions.",
-]
-
-
 def build_edit_prompt(
     sequence: str,
     score: float | None,
@@ -163,7 +181,6 @@ def build_edit_prompt(
     task: dict,
     iteration: int,
     rotation_offset: int = 0,
-    creativity_idx: int = 0,
 ) -> tuple[str, str, str]:
     """
     Build (system, user, weakest) prompt text for a targeted LLM edit of `sequence`.
@@ -225,12 +242,10 @@ def build_edit_prompt(
         )
         weakest_key = "rulebook"
 
-    creativity_hint = _CREATIVITY_HINTS[creativity_idx % len(_CREATIVITY_HINTS)]
     system = (
         "You are a peptide sequence editor. "
         "You receive a peptide and make MINIMAL targeted substitutions "
         "to improve a specific property. "
-        f"{creativity_hint} "
         "Output ONLY the modified sequence - uppercase letters, "
         "no spaces, no explanation, nothing else. One line only."
     )

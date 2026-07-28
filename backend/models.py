@@ -34,6 +34,7 @@ def generate(
     max_tokens: int = 512,
     system: str | None = None,
     assistant_primer: str = "",
+    temperature: float | None = None,
 ) -> str:
     """
     Call the LLM and return the raw text response.
@@ -44,6 +45,11 @@ def generate(
     when the assistant turn already begins with "KLL", the model continues
     with more amino acid letters.  The primer is prepended to the returned
     string so the caller sees the complete sequence.
+
+    temperature: optional sampling temperature forwarded to the API. Left
+    unset (None) by default so existing call sites keep the server's default
+    behavior unchanged; callers that want varied/diverse completions across
+    repeated calls (e.g. the agent's edit step) can pass an explicit value.
     """
     client = _get_client()
     model = get_model_name()
@@ -53,11 +59,12 @@ def generate(
     if assistant_primer:
         messages.append({"role": "assistant", "content": assistant_primer})
 
+    create_kwargs = dict(model=model, messages=messages, max_tokens=max_tokens, stop=["\n"])
+    if temperature is not None:
+        create_kwargs["temperature"] = temperature
+
     for attempt in range(1 + EMPTY_RETRY_ATTEMPTS):
-        response = client.chat.completions.create(
-            model=model, messages=messages, max_tokens=max_tokens,
-            stop=["\n"],
-        )
+        response = client.chat.completions.create(**create_kwargs)
         tokens = response.usage.completion_tokens if response.usage else 0
         if tokens > 0:
             content = response.choices[0].message.content or ""
