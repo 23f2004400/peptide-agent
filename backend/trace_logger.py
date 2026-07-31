@@ -163,6 +163,8 @@ class TraceLogger:
         next_prompt: str = "",
         mode: str = "",
         weakest: str = "",
+        ngram_floor: float = 0.35,
+        blosum_floor: float = 0.35,
     ) -> None:
         ts     = _now()
         prompt = self._pending_prompt
@@ -219,6 +221,13 @@ class TraceLogger:
                 parts.append(f"rulebook valid=False ({n_issues} issue(s))")
             if score is not None and score < threshold:
                 parts.append(f"score={score:.4f} < threshold={threshold:.2f}")
+            if effective_reference:
+                cur_ngram = comp.get("ngram_bleu", 1.0)
+                cur_blosum = comp.get("blosum", 1.0)
+                if cur_ngram < ngram_floor:
+                    parts.append(f"ngram_bleu={cur_ngram:.4f} < floor={ngram_floor:.2f}")
+                if cur_blosum < blosum_floor:
+                    parts.append(f"blosum={cur_blosum:.4f} < floor={blosum_floor:.2f}")
             reason = "; ".join(parts) or "unknown"
 
         fb_issues     = fb.get("issues", [])
@@ -293,7 +302,7 @@ class TraceLogger:
         lines += [
             f"RULEBOOK FITNESS: {rb_score:.4f}",
             "",
-            f"RULEBOOK RESULT: {'PASS ✓' if passed else 'FAIL ✗'}",
+            f"OVERALL RESULT: {'PASS ✓' if passed else 'FAIL ✗'}",
             f"  Reason: {reason}",
             "",
         ]

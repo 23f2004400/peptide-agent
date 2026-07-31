@@ -78,7 +78,16 @@ def _get_ranges(task: dict) -> tuple[int, int, int, int, int, int]:
     return len_lo, len_hi, charge_lo, charge_hi, hydro_lo, hydro_hi
 
 
-def _initial_prompt(task: dict, feedback_history: list[dict] | None = None) -> str:
+_ANCHOR_CHARGE_AA = {'K': 1, 'R': 1, 'D': -1, 'E': -1}
+_ANCHOR_HYDRO_AA = set('LIVFWMAYC')
+
+
+def _initial_prompt(
+    task: dict,
+    feedback_history: list[dict] | None = None,
+    rag_examples: list[dict] | None = None,
+    reference: str = '',
+) -> str:
     length = task.get('length', 12)
     activities = task.get('activities', [])
     act_labels = [_ACTIVITY_LABELS.get(a, a) for a in activities]
@@ -109,20 +118,70 @@ def _initial_prompt(task: dict, feedback_history: list[dict] | None = None) -> s
                                       else " [use fewer L/I/V/F/W/M]")
                 break
 
+    rag_section = ""
+    if rag_examples:
+        rag_lines = [
+            "\nREAL PEPTIDES FROM DATABASE (use as structural inspiration):",
+            "These are validated peptides with similar properties to your target.",
+            "Do NOT copy them directly. Use them to guide residue choices.\n",
+        ]
+        for i, ex in enumerate(rag_examples, 1):
+            acts = ', '.join(ex.get('activities', [])) or 'none'
+            rag_lines.append(
+                f"  Example {i}: {ex['sequence']}"
+                f"  [len={ex['length']}, "
+                f"charge={ex['charge']:+d}, "
+                f"hydro={ex['hydro_pct']:.0f}%, "
+                f"activity={acts}]"
+            )
+        rag_section = "\n".join(rag_lines) + "\n"
+
+    # Reference anchor — surfaces the actual target's motifs/charge/hydro so
+    # generation has something concrete to converge toward instead of
+    # producing a functionally-valid but sequentially unrelated sequence
+    # (the main driver of n-gram BLEU sitting near 0 in iteration 1). Only a
+    # real sequence, not an auto-picked default's absence, triggers this —
+    # callers that want the terse fallback prompt simply omit `reference`.
+    anchor_section = ""
+    ref_upper = reference.upper() if reference else ""
+    if ref_upper and len(ref_upper) >= 5:
+        ref_charge = sum(_ANCHOR_CHARGE_AA.get(aa, 0) for aa in ref_upper)
+        ref_hydro = round(
+            100 * sum(1 for aa in ref_upper if aa in _ANCHOR_HYDRO_AA) / len(ref_upper), 1
+        )
+        anchor_section = (
+            f"\nREFERENCE SEQUENCE (use as structural inspiration):\n"
+            f"{ref_upper}\n"
+            f"Key patterns to approximate in your generated sequence:\n"
+            f"- Opening motif (first 4 residues): {ref_upper[:4]}\n"
+            f"- Closing motif (last 3 residues): {ref_upper[-3:]}\n"
+            f"- Net charge: {ref_charge:+d}\n"
+            f"- Hydrophobic fraction: {ref_hydro:.0f}%\n"
+            f"Generate a NOVEL sequence that shares similar motifs "
+            f"but is not identical to the reference.\n"
+        )
+
     return (
         f"Generate one {act_str} peptide meeting ALL of:\n"
         f"- Length: between {len_lo} and {len_hi} amino acids\n"
         f"- Net charge: between {charge_lo_str} and {charge_hi_str}{charge_note}\n"
         f"- Hydrophobic residues: between {hydro_lo}% and {hydro_hi}%{hydro_note}\n"
         f"- Alphabet: 20 standard amino acids only\n"
+        f"{rag_section}"
+        f"{anchor_section}"
         f"\n"
         f"Output: one line, uppercase letters only, nothing else.\n"
         f"Sequence:"
     )
 
 
-def build_prompt(task: dict, feedback_history: list[dict] | None = None) -> str:
-    return _initial_prompt(task, feedback_history)
+def build_prompt(
+    task: dict,
+    feedback_history: list[dict] | None = None,
+    rag_examples: list[dict] | None = None,
+    reference: str = '',
+) -> str:
+    return _initial_prompt(task, feedback_history, rag_examples, reference)
 
 
 def build_feedback_entry(seq: str, score, validation: dict, task: dict,

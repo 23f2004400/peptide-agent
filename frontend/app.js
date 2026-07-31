@@ -339,6 +339,7 @@ function resetResults() {
   currentPdb = null;
   structureViewer = null;
   document.getElementById('structureViewer').innerHTML = '';
+  document.getElementById('graphCard').style.display = 'none';
 }
 
 function clearTrace() {
@@ -353,6 +354,10 @@ const MODE_BADGES = {
   deterministic:       { label: 'EDIT det',          color: '#00e5c3' },
   edit_explored:       { label: null /* + weakest */, color: '#fbbf24' },
   edit_stuck:          { label: 'edit_stuck',        color: '#64748b' },
+  motif_inject:        { label: 'MOTIF INJECT',      color: '#10b981' },
+  escape_positional:   { label: 'ESCAPE 1: positions', color: '#f97316' },
+  escape_forced:       { label: 'ESCAPE 2: forced',  color: '#f97316' },
+  escape_exact:        { label: 'ESCAPE 3: exact',   color: '#f97316' },
   generate_degenerate: { label: 'generate_degen',    color: '#ef4444' },
 };
 
@@ -435,6 +440,7 @@ function renderResult(result) {
 
   renderPlddt(result.plddt_score, result.plddt_confidence);
   renderStructure(result.plddt_pdb);
+  renderGraphFeatures(result.graph_features);
 
   if (result.components && Object.keys(result.components).length > 0) {
     renderComponents(result.components, result.plddt_score);
@@ -514,6 +520,41 @@ function downloadPdb() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+/* Structural graph analysis (H-bonds/ionic/pi-pi interactions) — additive,
+   derived from the same ESMFold PDB structure as the pLDDT badge/viewer. */
+function graphScoreStyle(score) {
+  if (score >= 3.0) return { color: '#00e5c3', label: 'Highly Structured' };
+  if (score >= 1.5) return { color: '#3b82f6', label: 'Moderately Structured' };
+  if (score >= 0.5) return { color: '#fbbf24', label: 'Loosely Structured' };
+  return { color: '#64748b', label: 'Flexible / Disordered' };
+}
+
+function renderGraphFeatures(graph) {
+  const card = document.getElementById('graphCard');
+  if (!graph || graph.structure_score == null) {
+    card.style.display = 'none';
+    return;
+  }
+
+  const style = graphScoreStyle(graph.structure_score);
+  const bar = document.getElementById('graphScoreBar');
+  const val = document.getElementById('graphScoreVal');
+  bar.style.width = `${Math.min(100, graph.structure_score / 5 * 100)}%`;
+  bar.style.background = style.color;
+  val.textContent = `${graph.structure_score.toFixed(2)}`;
+  val.style.color = style.color;
+
+  const counts = document.getElementById('graphCounts');
+  counts.innerHTML = `
+    <span>H-bonds: <span class="count-val">${graph.n_hbonds ?? '–'}</span></span>
+    <span>Ionic: <span class="count-val">${graph.n_ionic ?? '–'}</span></span>
+    <span>Pi-Pi Stacking: <span class="count-val">${graph.n_pi_pi ?? '–'}</span></span>
+  `;
+
+  document.getElementById('graphInterp').textContent = graph.interpretation || '';
+  card.style.display = 'block';
 }
 
 function renderComponents(comp, plddtScore) {

@@ -14,7 +14,10 @@ from .rulebook import validate_sequence, rulebook_score
 from .peptide_bleu import peptide_metric, score_components, ACTIVITY_WEIGHTS
 from .prompt_builder import build_prompt, get_system_prompt, _resolve_charge
 from .trace_logger import TraceLogger
-from .tools.sequence_editor import deterministic_edit, build_edit_prompt
+from .tools.sequence_editor import (
+    deterministic_edit, build_edit_prompt, inject_reference_motif,
+    build_positional_edit_prompt, forced_position_swap, build_exact_swap_instruction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -38,11 +41,48 @@ CANONICAL_AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
 
 VALID_AA_RE = re.compile(r'[ACDEFGHIKLMNPQRSTVWY]{4,}')
 
+
+
+# Words spellable entirely in the 20-letter AA alphabet, long/distinctive
+# enough that a coincidental match in a genuine designed sequence is
+# vanishingly unlikely (unlike short common words — "THE"/"AND"/"ARE" are all
+# spellable too, but at 3 letters they collide with real random-ish sequences
+# often enough to cause false-positive rejections, so they're deliberately
+# left out). Catches leaked-prompt/training-data artifacts like
+# "ALWKALWPEPTIDEALWPEP" that pass every other filter because they're
+# already uppercase in the raw model output (the case-origin check in
+# extract_sequence only catches lowercase-origin English words, not this).
+_HALLUCINATION_WORDS = ("PEPTIDE", "SEQUENCE", "ANSWER", "EXPLANATION", "DESIGNED")
+
+
+def has_word_pattern(seq: str) -> bool:
+    seq_upper = seq.upper()
+    return any(word in seq_upper for word in _HALLUCINATION_WORDS)
+
+
+def is_fully_valid(seq: str) -> bool:
+    """
+    Hard validation gate: every extraction path already filters to
+    VALID_AAS_SET, so the alphabet check shouldn't ever reject anything in
+    practice — kept as a defense-in-depth boundary check before a sequence is
+    used/logged as the agent's current best, in case some future code path
+    bypasses extract_sequence()/deterministic_edit()'s existing validation.
+    The word-pattern check is the one part of this that does actively catch
+    real cases — see has_word_pattern().
+    """
+    return (
+        bool(seq)
+        and len(seq) >= 4
+        and all(c in VALID_AAS_SET for c in seq.upper())
+        and not has_word_pattern(seq)
+    )
+
+
 # Minimum acceptable N-gram/BLOSUM62 scores for an attempt to be considered
 # "passed" — prevents the loop from stopping early on aggregate score alone
 # while residue ordering/motif similarity to the reference is still poor.
-NGRAM_FLOOR = 0.35
-BLOSUM_FLOOR = 0.35
+NGRAM_FLOOR = 0.05
+BLOSUM_FLOOR = 0.15
 
 # Extra same-prompt tries when the model's completion degenerates into the
 # assistant primer plus noise (garbage/foreign-script continuation) instead of
@@ -125,6 +165,8 @@ class AgentResult:
     trace: list[dict]
     time_seconds: float
     reference_used: str = ''
+    rag_examples_used: int = 0
+    rag_sequences: list = field(default_factory=list)
 
 
 class PepForgeAgent:
@@ -203,10 +245,19 @@ class PepForgeAgent:
                     edge_stripped = edge_stripped[:target_length]
                 return edge_stripped
 
-        # Priority 2: collapse dash-separated notation (A-C-D-E → ACDE)
+        # Priority 2: collapse dash-separated notation (A-C-D-E → ACDE).
+        # Built from raw_stripped (original case), not upper — the lookaround
+        # only matches already-uppercase letters, so a genuine dash-formatted
+        # sequence (already uppercase) still collapses, while a lowercase
+        # hyphenated English word (e.g. "single-letter") does not, since its
+        # lowercase letters never satisfy the uppercase-only character class.
+        # Collapsing from `upper` instead let "single-letter" become the
+        # spurious candidate "SINGLELETTER" with no way to origin-check it
+        # (position mapping is ambiguous post-collapse) — this sidesteps
+        # that entirely by construction rather than adding a fragile check.
         dash_collapsed = re.sub(
             r'(?<=[ACDEFGHIKLMNPQRSTVWY])-(?=[ACDEFGHIKLMNPQRSTVWY])',
-            '', upper
+            '', raw_stripped
         )
 
         # Priority 3: regex search — skip matches whose original span was
@@ -227,9 +278,9 @@ class PepForgeAgent:
             seen.add(match_str)
             candidates.append(match_str)
 
-        # Dash-collapsed candidates: position mapping is ambiguous so skip the
-        # origin check, but still deduplicate.
-        if dash_collapsed != upper:
+        # Dash-collapsed candidates: already origin-safe by construction (see
+        # above), just deduplicate.
+        if dash_collapsed != raw_stripped:
             for m in VALID_AA_RE.finditer(dash_collapsed):
                 match_str = m.group()
                 if match_str in CANONICAL_AA_ALPHABET or match_str in seen:
@@ -369,6 +420,8 @@ class PepForgeAgent:
                 trace=trace[:],
                 time_seconds=round(time.time() - t0, 2),
                 reference_used=reference_used,
+                rag_examples_used=rag_examples_used,
+                rag_sequences=rag_sequences,
             )
             overall_bleu = best_overall_result.score if best_overall_result is not None else -1.0
             if (best_overall_result is None
@@ -394,12 +447,35 @@ class PepForgeAgent:
         edit_base_components: dict = {}
         edit_base_validation: dict = {}
 
+        rag_examples_used = 0
+        rag_sequences: list = []
+
         # ====================================================================
         # ATTEMPT 1 — generate from scratch. Runs exactly once. Internal-retry
         # + clean-prompt fallback logic is unchanged from before this feature.
         # ====================================================================
         attempt_num = 1
-        prompt = task.get('prompt_override') or build_prompt(task, [])
+
+        if task.get('prompt_override'):
+            prompt = task['prompt_override']
+        else:
+            # RAG retrieval — additive only, never blocks generation. Lazy
+            # import (not a top-level one) so a missing numpy/pandas/faiss on
+            # a given machine degrades to "no RAG this run" instead of making
+            # backend.agent itself unimportable.
+            rag_examples: list = []
+            try:
+                from .rag.peptide_retriever import search_similar_peptides
+                rag_examples = search_similar_peptides(task, top_k=5)
+                if rag_examples:
+                    logger.info("[A1] RAG retrieved %d similar peptides", len(rag_examples))
+            except Exception as exc:
+                logger.debug("[A1] RAG retrieval unavailable: %s", exc)
+                rag_examples = []
+            rag_examples_used = len(rag_examples)
+            rag_sequences = [ex['sequence'] for ex in rag_examples[:3]]
+            prompt = build_prompt(task, [], rag_examples=rag_examples, reference=effective_reference)
+
         system = get_system_prompt()
         trace_log.log_prompt(attempt_num, prompt)
 
@@ -419,6 +495,9 @@ class PepForgeAgent:
                 seq = self.extract_sequence(raw, target_length)
                 if seq and len(seq) > target_length:
                     seq = seq[:target_length]
+                if not is_fully_valid(seq):
+                    logger.debug("[A%d] extracted sequence failed hard validation: %r", attempt_num, seq)
+                    seq = ''
                 if seq and len(seq) >= degenerate_floor:
                     break
                 logger.debug(
@@ -441,6 +520,8 @@ class PepForgeAgent:
                     fallback_seq = self.extract_sequence(fallback_raw, target_length)
                     if fallback_seq and len(fallback_seq) > target_length:
                         fallback_seq = fallback_seq[:target_length]
+                    if not is_fully_valid(fallback_seq):
+                        fallback_seq = ''
                     logger.debug(
                         "[A%d] clean-prompt fallback: len=%d, raw=%r",
                         attempt_num, len(fallback_seq or ''), fallback_raw[:60],
@@ -524,6 +605,7 @@ class PepForgeAgent:
                 effective_reference=effective_reference,
                 reference_used=reference_used, threshold=threshold,
                 next_prompt="", mode='generate', weakest='',
+                ngram_floor=NGRAM_FLOOR, blosum_floor=BLOSUM_FLOOR,
             )
 
             if passed:
@@ -535,81 +617,168 @@ class PepForgeAgent:
         # cleared the threshold.
         # ====================================================================
         if edit_base_sequence and not passed:
+            consecutive_stuck = 0
+            changed_positions: set[int] = set()
             for attempt_num in range(2, max_retries + 1):
                 rotation_offset = attempt_num - 2
                 temperature = EDIT_TEMPERATURES[rotation_offset % len(EDIT_TEMPERATURES)]
 
+                # Defense-in-depth (shouldn't trigger in practice — every write
+                # path already validates — see is_fully_valid()): if the
+                # working sequence somehow isn't clean, don't try to edit
+                # garbage — candidates ends up empty below and falls back to
+                # best_sequence at the end-of-loop safety net.
+                if not is_fully_valid(edit_base_sequence):
+                    logger.warning(
+                        "[A%d] edit_base_sequence failed validation (%r)",
+                        attempt_num, edit_base_sequence,
+                    )
+
                 candidates: list[tuple] = [
                     ('original', edit_base_sequence, edit_base_score, edit_base_rb_score,
                      edit_base_components, edit_base_validation)
-                ]
+                ] if is_fully_valid(edit_base_sequence) else []
 
-                # Exactly one LLM edit attempt per iteration (still with the
-                # existing internal-retry-on-prose loop — that targets "response
-                # was unusable garbage," a narrower and already-proven mechanism,
-                # distinct from "response equaled the input"). If it fails,
-                # matches the input, or errors, fall straight through to the
-                # now-guaranteed-different deterministic_edit() below rather than
-                # trying more LLM rotations — rotation now happens *across*
-                # iterations (via rotation_offset) instead of retries within one.
                 weakest = ''
                 edit_raw = ''
                 llm_seq = ''
-                try:
-                    edit_system, edit_user, weakest = build_edit_prompt(
-                        edit_base_sequence, edit_base_score, edit_base_components, task, attempt_num,
-                        rotation_offset=rotation_offset,
-                    )
-                    trace_log.log_prompt(attempt_num, edit_user)
 
-                    # Anchor the primer on the sequence actually being edited, not
-                    # the activity's generation primer — priming with e.g. "ALWK"
-                    # here made the model prepend that primer to (a corrupted copy
-                    # of) the original sequence instead of a genuine minimal edit.
-                    edit_primer = edit_base_sequence[:4]
+                # edit_stuck escalation — three tactics tried in order across
+                # consecutive stuck iterations, each more forceful/specific
+                # than the last, none of them a from-scratch regeneration:
+                #   1 stuck: target different positions than previous edits
+                #   2 stuck: no LLM — deterministic BLOSUM-conservative swap
+                #   3+ stuck: name one exact position + substitution
+                # Each is just another scored candidate below — it only takes
+                # over edit_base_sequence if it's actually competitive.
+                if consecutive_stuck >= 1 and is_fully_valid(edit_base_sequence):
+                    try:
+                        if consecutive_stuck == 1:
+                            esc_system, esc_user = build_positional_edit_prompt(
+                                edit_base_sequence, edit_base_components, task,
+                                excluded_positions=changed_positions,
+                            )
+                            trace_log.log_prompt(attempt_num, esc_user)
+                            esc_raw = models.generate(
+                                esc_user, system=esc_system,
+                                assistant_primer=edit_base_sequence[:4],
+                                max_tokens=target_length + 5,
+                                temperature=temperature,
+                            )
+                            trace_log.log_raw_response(attempt_num, esc_raw)
+                            esc_seq = self.extract_sequence(esc_raw, target_length) if esc_raw else ''
+                            if esc_seq and len(esc_seq) > target_length:
+                                esc_seq = esc_seq[:target_length]
+                            if (is_fully_valid(esc_seq) and len(esc_seq) >= degenerate_floor
+                                    and esc_seq != edit_base_sequence):
+                                esc_val, esc_rb, esc_comp, esc_score = score_candidate(esc_seq)
+                                candidates.append(('escape_positional', esc_seq, esc_score, esc_rb, esc_comp, esc_val))
 
-                    for internal_try in range(1 + INTERNAL_SHORT_RETRY_ATTEMPTS):
-                        edit_raw = models.generate(
-                            edit_user, system=edit_system,
-                            assistant_primer=edit_primer,
-                            max_tokens=target_length + 5,
-                            temperature=temperature,
+                        elif consecutive_stuck == 2:
+                            esc_seq = forced_position_swap(edit_base_sequence, edit_base_components, task)
+                            trace_log.log_prompt(attempt_num, "(escape_forced — deterministic, no LLM prompt)")
+                            trace_log.log_raw_response(attempt_num, "(escape_forced — deterministic, no LLM call)")
+                            if esc_seq and esc_seq != edit_base_sequence and is_fully_valid(esc_seq):
+                                esc_val, esc_rb, esc_comp, esc_score = score_candidate(esc_seq)
+                                candidates.append(('escape_forced', esc_seq, esc_score, esc_rb, esc_comp, esc_val))
+
+                        else:
+                            override = build_exact_swap_instruction(edit_base_sequence, edit_base_components)
+                            esc_system, esc_user, _ = build_edit_prompt(
+                                edit_base_sequence, edit_base_score, edit_base_components, task, attempt_num,
+                                rotation_offset=rotation_offset, reference=effective_reference or '',
+                                override_instruction=override,
+                            )
+                            trace_log.log_prompt(attempt_num, esc_user)
+                            esc_raw = models.generate(
+                                esc_user, system=esc_system,
+                                assistant_primer=edit_base_sequence[:4],
+                                max_tokens=target_length + 5,
+                                temperature=temperature,
+                            )
+                            trace_log.log_raw_response(attempt_num, esc_raw)
+                            esc_seq = self.extract_sequence(esc_raw, target_length) if esc_raw else ''
+                            if esc_seq and len(esc_seq) > target_length:
+                                esc_seq = esc_seq[:target_length]
+                            if (is_fully_valid(esc_seq) and len(esc_seq) >= degenerate_floor
+                                    and esc_seq != edit_base_sequence):
+                                esc_val, esc_rb, esc_comp, esc_score = score_candidate(esc_seq)
+                                candidates.append(('escape_exact', esc_seq, esc_score, esc_rb, esc_comp, esc_val))
+                    except Exception as exc:
+                        logger.warning(
+                            "[A%d] edit_stuck escape (tier %d) failed: %s",
+                            attempt_num, consecutive_stuck, exc,
                         )
-                        if not edit_raw:
-                            continue
-                        llm_seq = self.extract_sequence(edit_raw, target_length)
-                        if llm_seq and len(llm_seq) > target_length:
-                            llm_seq = llm_seq[:target_length]
 
-                        # Reject echoes of our own prompt text mistaken for a real
-                        # edit — e.g. the model answering with prose that happens
-                        # to quote "WEAKEST COMPONENT" verbatim, which is itself
-                        # spellable in valid AA letters and long enough to clear
-                        # the degenerate-length floor below. Only the part after
-                        # the primer is checked, since the primer itself always
-                        # echoes edit_base_sequence's start by design.
-                        is_prompt_echo = (
-                            llm_seq and len(llm_seq) > 4
-                            and llm_seq[4:] in (edit_system + " " + edit_user).upper()
+                # Regular rotating-component LLM edit attempt (still with the
+                # existing internal-retry-on-prose loop — that targets "response
+                # was unusable garbage," a narrower and already-proven mechanism,
+                # distinct from "response equaled the input"). Skipped while an
+                # escape tier is active this iteration — the escape supersedes
+                # it, so running both would double up on LLM calls and mix
+                # signals. If it fails, matches the input, or errors, falls
+                # straight through to the now-guaranteed-different
+                # deterministic_edit() below rather than trying more LLM
+                # rotations — rotation happens *across* iterations (via
+                # rotation_offset) instead of retries within one.
+                if consecutive_stuck == 0:
+                    try:
+                        edit_system, edit_user, weakest = build_edit_prompt(
+                            edit_base_sequence, edit_base_score, edit_base_components, task, attempt_num,
+                            rotation_offset=rotation_offset, reference=effective_reference or '',
                         )
-                        if (llm_seq and len(llm_seq) >= degenerate_floor
-                                and llm_seq != edit_base_sequence and not is_prompt_echo):
-                            break
-                        logger.debug(
-                            "[A%d] edit internal retry %d/%d: %s (len=%d, raw=%r)",
-                            attempt_num, internal_try + 1, INTERNAL_SHORT_RETRY_ATTEMPTS,
-                            "echoed prompt text" if is_prompt_echo else "degenerate/prose response",
-                            len(llm_seq or ''), edit_raw[:60],
-                        )
-                        llm_seq = ''
-                    trace_log.log_raw_response(attempt_num, edit_raw)
+                        trace_log.log_prompt(attempt_num, edit_user)
 
-                    if llm_seq:
-                        llm_val, llm_rb, llm_comp, llm_score = score_candidate(llm_seq)
-                        candidates.append(('llm_edit', llm_seq, llm_score, llm_rb, llm_comp, llm_val))
-                except Exception as exc:
-                    logger.warning("[A%d] llm_edit candidate failed: %s", attempt_num, exc)
-                    trace_log.log_raw_response(attempt_num, edit_raw)
+                        # Anchor the primer on the sequence actually being edited, not
+                        # the activity's generation primer — priming with e.g. "ALWK"
+                        # here made the model prepend that primer to (a corrupted copy
+                        # of) the original sequence instead of a genuine minimal edit.
+                        edit_primer = edit_base_sequence[:4]
+
+                        for internal_try in range(1 + INTERNAL_SHORT_RETRY_ATTEMPTS):
+                            edit_raw = models.generate(
+                                edit_user, system=edit_system,
+                                assistant_primer=edit_primer,
+                                max_tokens=target_length + 5,
+                                temperature=temperature,
+                            )
+                            if not edit_raw:
+                                continue
+                            llm_seq = self.extract_sequence(edit_raw, target_length)
+                            if llm_seq and len(llm_seq) > target_length:
+                                llm_seq = llm_seq[:target_length]
+                            if not is_fully_valid(llm_seq):
+                                llm_seq = ''
+
+                            # Reject echoes of our own prompt text mistaken for a real
+                            # edit — e.g. the model answering with prose that happens
+                            # to quote "WEAKEST COMPONENT" verbatim, which is itself
+                            # spellable in valid AA letters and long enough to clear
+                            # the degenerate-length floor below. Only the part after
+                            # the primer is checked, since the primer itself always
+                            # echoes edit_base_sequence's start by design.
+                            is_prompt_echo = (
+                                llm_seq and len(llm_seq) > 4
+                                and llm_seq[4:] in (edit_system + " " + edit_user).upper()
+                            )
+                            if (llm_seq and len(llm_seq) >= degenerate_floor
+                                    and llm_seq != edit_base_sequence and not is_prompt_echo):
+                                break
+                            logger.debug(
+                                "[A%d] edit internal retry %d/%d: %s (len=%d, raw=%r)",
+                                attempt_num, internal_try + 1, INTERNAL_SHORT_RETRY_ATTEMPTS,
+                                "echoed prompt text" if is_prompt_echo else "degenerate/prose response",
+                                len(llm_seq or ''), edit_raw[:60],
+                            )
+                            llm_seq = ''
+                        trace_log.log_raw_response(attempt_num, edit_raw)
+
+                        if llm_seq:
+                            llm_val, llm_rb, llm_comp, llm_score = score_candidate(llm_seq)
+                            candidates.append(('llm_edit', llm_seq, llm_score, llm_rb, llm_comp, llm_val))
+                    except Exception as exc:
+                        logger.warning("[A%d] llm_edit candidate failed: %s", attempt_num, exc)
+                        trace_log.log_raw_response(attempt_num, edit_raw)
 
                 # LLM attempt failed/matched input — immediately use the
                 # guaranteed-different deterministic fallback instead of
@@ -619,6 +788,33 @@ class PepForgeAgent:
                     if det_seq and det_seq != edit_base_sequence:
                         det_val, det_rb, det_comp, det_score = score_candidate(det_seq)
                         candidates.append(('deterministic', det_seq, det_score, det_rb, det_comp, det_val))
+
+                # Deterministic motif-injection candidate: guarantees some
+                # literal subsequence overlap with the reference (ngram_bleu
+                # stuck at 0 is otherwise very hard for the LLM edit to fix
+                # reliably) — scored and compared like every other candidate,
+                # so it only wins if it's actually competitive.
+                if effective_reference:
+                    try:
+                        motif_seq = inject_reference_motif(
+                            edit_base_sequence, effective_reference, target_length,
+                        )
+                        if motif_seq != edit_base_sequence and is_fully_valid(motif_seq):
+                            motif_val, motif_rb, motif_comp, motif_score = score_candidate(motif_seq)
+                            candidates.append(('motif_inject', motif_seq, motif_score, motif_rb, motif_comp, motif_val))
+                    except Exception as exc:
+                        logger.warning("[A%d] motif injection candidate failed: %s", attempt_num, exc)
+
+                if not candidates:
+                    # Only reachable if edit_base_sequence somehow failed
+                    # validation AND every fallback (fresh generation,
+                    # deterministic) also failed to produce anything usable —
+                    # fall back to the true best-known result so there's
+                    # always something to score/log this iteration.
+                    candidates = [(
+                        'original', best_sequence, best_score, best_rb_score,
+                        best_components, best_validation,
+                    )]
 
                 def cand_key(c):
                     _, _, s, rb, _, _ = c
@@ -654,6 +850,12 @@ class PepForgeAgent:
 
                 if is_different and within_tolerance:
                     delta = (w_score or 0.0) - (edit_base_score or 0.0)
+                    # Record which positions this edit actually touched, for
+                    # Escape 1 (build_positional_edit_prompt) to target
+                    # different ones next time it's needed.
+                    for i, (old_aa, new_aa) in enumerate(zip(edit_base_sequence, w_seq)):
+                        if old_aa != new_aa:
+                            changed_positions.add(i)
                     edit_base_sequence, edit_base_score = w_seq, w_score
                     edit_base_rb_score, edit_base_components, edit_base_validation = w_rb, w_comp, w_val
                     mode = w_mode if improved_true_best else 'edit_explored'
@@ -661,12 +863,14 @@ class PepForgeAgent:
                     delta = 0.0
                     mode = 'edit_stuck'
 
+                consecutive_stuck = consecutive_stuck + 1 if mode == 'edit_stuck' else 0
+
                 # "Passed" is evaluated against the true best, not the (possibly
                 # merely-explored, momentarily-worse) edit base — early-stop
                 # should only fire once the actual best-ever answer clears the
                 # threshold, never on an exploratory dip.
                 passed = is_passed(best_score, best_components, best_validation)
-                label_weakest = 'det' if w_mode == 'deterministic' else weakest
+                label_weakest = 'det' if w_mode == 'deterministic' else (weakest or w_mode)
 
                 logger.info(
                     "[A%d] EDIT mode=%s seq=%s bleu=%s rb=%.2f delta=%+.4f passed=%s",
@@ -692,6 +896,7 @@ class PepForgeAgent:
                     effective_reference=effective_reference,
                     reference_used=reference_used, threshold=threshold,
                     next_prompt="", mode=mode, weakest=weakest,
+                    ngram_floor=NGRAM_FLOOR, blosum_floor=BLOSUM_FLOOR,
                 )
 
                 if passed:

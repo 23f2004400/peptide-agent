@@ -9,6 +9,8 @@ testable without a live model/gateway.
 
 from __future__ import annotations
 
+import random
+
 from ..rulebook import validate_sequence
 
 VALID_AA  = set("ACDEFGHIKLMNPQRSTVWY")
@@ -103,6 +105,7 @@ _CONSERVATIVE_SUBS = {
     'F': 'Y', 'Y': 'W', 'W': 'F',
     'A': 'G', 'G': 'A',
     'N': 'Q', 'Q': 'N',
+    'M': 'L', 'H': 'N', 'C': 'A', 'P': 'A',
 }
 
 
@@ -144,6 +147,53 @@ def deterministic_edit(sequence: str, task: dict) -> str | None:
     return edited
 
 
+def inject_reference_motif(sequence: str, reference: str, target_length: int) -> str:
+    """
+    Forcibly splice a 4-char motif from `reference` into `sequence` at a fixed
+    offset. Deterministic, no LLM involved — a guaranteed way to get some
+    literal subsequence overlap with the reference when ngram_bleu is stuck
+    at 0 and the LLM edit isn't reliably following a "reuse this motif"
+    instruction. Just another candidate for the caller to score alongside the
+    others — not assumed to be an improvement (splicing in 4 residues can
+    just as easily wreck charge/hydrophobicity), so it only wins if it's
+    actually competitive on the real metric.
+    """
+    if not reference or len(reference) < 4:
+        return sequence
+
+    ref = ''.join(c for c in reference.upper() if c in VALID_AA)
+    if len(ref) < 4:
+        return sequence
+
+    seq = list(sequence.upper())
+
+    best_motif = None
+    for i in range(len(ref) - 3):
+        motif = ref[i:i + 4]
+        if all(c in VALID_AA for c in motif):
+            best_motif = motif
+            break
+
+    if not best_motif:
+        return sequence
+
+    # Insert at position 4 (keeps first 4 chars intact) — preserves the
+    # opening motif/charge pattern while adding reference similarity.
+    insert_pos = min(4, max(0, len(seq) - 4))
+    for j, aa in enumerate(best_motif):
+        if insert_pos + j < len(seq):
+            seq[insert_pos + j] = aa
+
+    result = ''.join(seq)
+
+    if len(result) > target_length:
+        result = result[:target_length]
+    elif len(result) < target_length:
+        result = result + 'L' * (target_length - len(result))
+
+    return result
+
+
 # == LLM-GUIDED EDIT ==========================================================
 
 _COMPONENT_INSTRUCTIONS_TEMPLATE = {
@@ -181,6 +231,8 @@ def build_edit_prompt(
     task: dict,
     iteration: int,
     rotation_offset: int = 0,
+    reference: str = '',
+    override_instruction: str | None = None,
 ) -> tuple[str, str, str]:
     """
     Build (system, user, weakest) prompt text for a targeted LLM edit of `sequence`.
@@ -214,13 +266,31 @@ def build_edit_prompt(
         weakest_key = ""
         weakest_val = None
 
-    if weakest_key == "charge":
-        instruction = (
-            f"Current charge {actual_charge:+d}, target {charge_min:+d} to {charge_max:+d}. "
-            + (f"Add {charge_min - actual_charge} K or R residues by replacing neutral AA."
-               if actual_charge < charge_min
-               else f"Replace {actual_charge - charge_max} K/R with A or L.")
-        )
+    if override_instruction is not None:
+        # Escape-mechanism callers (see build_exact_swap_instruction) supply
+        # an exact, pre-built instruction — skip weakest-component selection
+        # entirely rather than have it compete with/dilute the override.
+        instruction = override_instruction
+        weakest_key = "escape_exact"
+        weakest_val = None
+    elif weakest_key == "charge":
+        # Cap the requested count at 3 so this instruction never asks for more
+        # changes than the "Change ONLY 2-4 residues" hard constraint below
+        # allows — a large charge gap (e.g. needing +5) previously produced
+        # a contradictory "add 5 ... change only 2-4" prompt, and the model
+        # would follow the higher number, overshooting into other properties.
+        if actual_charge < charge_min:
+            changes = min(charge_min - actual_charge, 3)
+            instruction = (
+                f"Current charge {actual_charge:+d}, target {charge_min:+d} to {charge_max:+d}. "
+                f"Replace exactly {changes} neutral residues (A, L, V, G, S, N) with K or R."
+            )
+        else:
+            changes = min(actual_charge - charge_max, 3)
+            instruction = (
+                f"Current charge {actual_charge:+d}, target {charge_min:+d} to {charge_max:+d}. "
+                f"Replace exactly {changes} K/R residues with A or L."
+            )
     elif weakest_key == "hydrophobicity":
         instruction = (
             f"Hydrophobic fraction {actual_hydro}%, target {hydro_min}-{hydro_max}%. "
@@ -242,6 +312,21 @@ def build_edit_prompt(
         )
         weakest_key = "rulebook"
 
+    # N-gram BLEU stuck near zero means the edit has no literal subsequence
+    # overlap with the reference at all — the generic ngram_bleu instruction
+    # above (common AMP residues) doesn't fix that, since "common" residues
+    # aren't necessarily the reference's own residues. Surface a short literal
+    # fragment of the actual reference as concrete motif material, regardless
+    # of which component the rotation is currently targeting this iteration
+    # (mirrors the fragment-hint pattern already used in prompt_builder.py's
+    # build_feedback_entry() for the same failure mode).
+    if override_instruction is None and reference and components.get("ngram_bleu", 1.0) < 0.05:
+        motif = reference[:6]
+        instruction += (
+            f' Your sequence shares no common subsequence with the reference '
+            f'peptide — work this literal fragment in somewhere: "{motif}".'
+        )
+
     system = (
         "You are a peptide sequence editor. "
         "You receive a peptide and make MINIMAL targeted substitutions "
@@ -257,6 +342,15 @@ def build_edit_prompt(
         else f"TARGETING: {weakest_key.upper()}\n"
     )
 
+    # Escape 3 asks for exactly one change — echoing "2-4 residues" here would
+    # reproduce the same contradictory-instruction bug already fixed once for
+    # the charge branch (the model follows whichever number appears larger).
+    change_count_line = (
+        "- Change ONLY 1 residue — the exact one named above, keep everything else identical\n"
+        if override_instruction is not None
+        else "- Change ONLY 2-4 residues, keep the rest identical\n"
+    )
+
     user = (
         f"Peptide to edit (best so far after iteration {iteration}, PeptideBLEU={score_str}):\n"
         f"{sequence}\n\n"
@@ -267,8 +361,121 @@ def build_edit_prompt(
         f"- Net charge: {charge_min:+d} to {charge_max:+d} (currently {actual_charge:+d})\n"
         f"- Hydrophobic {hydro_min}-{hydro_max}% (currently {actual_hydro}%)\n"
         f"- Only ACDEFGHIKLMNPQRSTVWY\n"
-        f"- Change ONLY 2-4 residues, keep the rest identical\n\n"
+        f"{change_count_line}\n"
         f"Output the edited sequence:"
     )
 
     return system, user, weakest_key
+
+
+# == edit_stuck ESCAPE MECHANISM ==============================================
+# Three escalating tactics tried in order across consecutive edit_stuck
+# iterations — each one more forceful/specific than the last, none of them
+# falling back to a from-scratch fresh generation. All three are just more
+# candidates for the caller to score and compare like any other; none of
+# them assume they're an improvement.
+
+def build_positional_edit_prompt(
+    sequence: str,
+    components: dict,
+    task: dict,
+    excluded_positions: set[int] | None = None,
+) -> tuple[str, str]:
+    """
+    Escape 1 (first stuck iteration): target different positions than the
+    ones already changed by prior successful edits, instead of repeating the
+    same weakest-component instruction that just produced a no-op.
+    """
+    excluded = excluded_positions or set()
+    available = [i for i in range(len(sequence)) if i not in excluded]
+    if not available:
+        # Every position has been touched at some point — exclusion has
+        # nothing left to bite on, so target the whole sequence again rather
+        # than produce an instruction with no positions in it.
+        available = list(range(len(sequence)))
+    target_pos = available[:4] if len(available) >= 4 else available
+
+    weakest_key = min(components, key=lambda k: components[k]) if components else "rulebook"
+    label = weakest_key.upper().replace('_', ' ')
+
+    system = (
+        "You are a peptide sequence editor. "
+        "You receive a peptide and make MINIMAL targeted substitutions "
+        "to improve a specific property. "
+        "Output ONLY the modified sequence - uppercase letters, "
+        "no spaces, no explanation, nothing else. One line only."
+    )
+    user = (
+        f"Peptide to edit:\n{sequence}\n\n"
+        f"TARGETING: {label}\n"
+        f"Change ONLY these specific positions (1-indexed): "
+        f"{[p + 1 for p in target_pos]}. Do not touch any other position.\n"
+        f"Replace each with a residue that improves {label.lower()}.\n"
+        f"HARD CONSTRAINTS:\n"
+        f"- Keep length exactly {len(sequence)} amino acids\n"
+        f"- Only ACDEFGHIKLMNPQRSTVWY\n\n"
+        f"Output the complete edited sequence:"
+    )
+    return system, user
+
+
+def forced_position_swap(sequence: str, components: dict, task: dict) -> str:
+    """
+    Escape 2 (second consecutive stuck iteration): no LLM call, pure code.
+    Guaranteed to produce a different sequence via a BLOSUM-conservative
+    change targeted at whichever component is currently weakest.
+    """
+    seq = list(sequence)
+    n = len(seq)
+    weakest = min(components, key=lambda k: components[k]) if components else ""
+
+    if weakest in ('ngram_bleu', 'blosum') and n >= 2:
+        pos_a = min(6, n - 1)
+        pos_b = min(12, n - 1)
+        if pos_a == pos_b:
+            pos_b = max(0, pos_a - 1)
+        if seq[pos_a] == seq[pos_b]:
+            # Swapping two identical residues is a no-op — this escape's
+            # entire point is guaranteeing a real change, so fall back to a
+            # conservative substitution instead.
+            seq[pos_a] = _CONSERVATIVE_SUBS.get(seq[pos_a], 'L')
+        else:
+            seq[pos_a], seq[pos_b] = seq[pos_b], seq[pos_a]
+    elif weakest == 'charge':
+        for i, aa in enumerate(seq):
+            if aa not in ('K', 'R', 'D', 'E'):
+                seq[i] = 'K'
+                break
+        else:
+            seq[min(7, n - 1)] = _CONSERVATIVE_SUBS.get(seq[min(7, n - 1)], 'L')
+    elif weakest == 'hydrophobicity':
+        for i, aa in enumerate(seq):
+            if aa not in HYDRO_AA and aa not in ('K', 'R', 'D', 'E'):
+                seq[i] = 'L'
+                break
+        else:
+            seq[min(7, n - 1)] = _CONSERVATIVE_SUBS.get(seq[min(7, n - 1)], 'L')
+    else:
+        pos = min(7, n - 1)
+        seq[pos] = _CONSERVATIVE_SUBS.get(seq[pos], 'L')
+
+    return ''.join(seq)
+
+
+def build_exact_swap_instruction(sequence: str, components: dict) -> str:
+    """
+    Escape 3 (third+ consecutive stuck iteration): name one exact position
+    and one exact substitution, too specific for the model to reproduce the
+    input unchanged. Passed as `override_instruction` to build_edit_prompt().
+    """
+    n = len(sequence)
+    pos = n // 2 if n < 6 else random.randint(2, n - 3)
+    current = sequence[pos]
+    new_aa = _CONSERVATIVE_SUBS.get(current, 'L')
+
+    return (
+        f"Make EXACTLY ONE change: replace position {pos + 1} "
+        f"(amino acid {current}) with {new_aa}. "
+        f"Keep ALL other {n - 1} residues IDENTICAL. "
+        f"Output the complete {n}-residue sequence."
+    )
