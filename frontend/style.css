@@ -454,6 +454,32 @@ body { display: flex; min-height: 100vh; }
   position: relative;
 }
 
+/* ── Structural graph analysis ───────────────────────────────────────────── */
+.graph-score-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+.graph-score-label { font-size: 11px; color: var(--text-secondary); width: 110px; min-width: 110px; }
+.graph-score-val {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  width: 50px;
+  text-align: right;
+}
+.graph-counts {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.graph-counts .count-val { color: var(--text-primary); font-weight: 600; }
+.graph-interp {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.5;
+}
+
 /* ── Loading spinner ─────────────────────────────────────────────────────── */
 @keyframes spin { to { transform: rotate(360deg); } }
 .spinner {

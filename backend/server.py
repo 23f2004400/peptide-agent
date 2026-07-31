@@ -146,12 +146,15 @@ async def _generate_stream(req: GenerateRequest) -> AsyncIterator[dict]:
                 "iterations": r.iterations,
                 "trace": r.trace,
                 "time_seconds": r.time_seconds,
+                "rag_examples_used": r.rag_examples_used,
+                "rag_sequences": r.rag_sequences,
             }
         }
 
         # pLDDT scoring — additive only, computed once on the final sequence,
         # never affects generation/retry logic. Never raises. Run off the
         # event loop since get_plddt() does a blocking HTTP call (up to ~60s).
+        plddt: dict = {}
         try:
             from .esmfold_scorer import get_plddt
             if r.sequence:
@@ -171,6 +174,28 @@ async def _generate_stream(req: GenerateRequest) -> AsyncIterator[dict]:
             final["result"]["plddt_passes"] = False
             final["result"]["plddt_interp"] = "pLDDT scoring unavailable"
             final["result"]["plddt_pdb"] = None
+
+        # Structural graph features — additive only, derived from the same PDB
+        # structure pLDDT already fetched above. Never raises; null on any
+        # failure (no PDB available, malformed structure, etc).
+        try:
+            pdb_text = plddt.get("pdb")
+            if pdb_text:
+                from .graph_features import pdb_to_graph_features
+                graph = pdb_to_graph_features(pdb_text)
+                final["result"]["graph_features"] = {
+                    "structure_score": graph.get("structure_score"),
+                    "n_hbonds": graph.get("n_hbonds"),
+                    "n_ionic": graph.get("n_ionic"),
+                    "n_pi_pi": graph.get("n_pi_pi"),
+                    "hbond_density": graph.get("hbond_density"),
+                    "ionic_density": graph.get("ionic_density"),
+                    "interpretation": graph.get("interpretation"),
+                } if graph.get("error") is None else None
+            else:
+                final["result"]["graph_features"] = None
+        except Exception:
+            final["result"]["graph_features"] = None
 
         yield {"data": json.dumps(final)}
 
