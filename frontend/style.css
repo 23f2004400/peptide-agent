@@ -430,6 +430,16 @@ body { display: flex; min-height: 100vh; }
   text-align: right;
 }
 
+/* ── Secondary structure (DSSP) ──────────────────────────────────────────── */
+.ss-string {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 1px;
+  color: var(--text-secondary);
+  word-break: break-all;
+  margin-bottom: 10px;
+}
+
 /* ── 3D structure viewer ─────────────────────────────────────────────────── */
 .pdb-download-btn {
   margin-left: auto;
@@ -478,6 +488,33 @@ body { display: flex; min-height: 100vh; }
   font-size: 11px;
   color: var(--text-muted);
   line-height: 1.5;
+}
+
+#protein-graph-container {
+  margin-top: 16px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+.graph-legend {
+  display: flex;
+  gap: 16px;
+  margin-bottom: 8px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.legend-item { display: flex; align-items: center; gap: 4px; }
+.legend-item.hbond { color: #fbbf24; }
+.legend-item.ionic { color: #3b82f6; }
+.legend-item.pipi  { color: #a855f7; }
+.legend-item.hydro { color: #34d399; }
+.node-label {
+  font-size: 9px;
+  fill: #e2e8f0;
+  text-anchor: middle;
+  dominant-baseline: central;
+  pointer-events: none;
 }
 
 /* ── Loading spinner ─────────────────────────────────────────────────────── */

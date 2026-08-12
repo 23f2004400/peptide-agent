@@ -175,27 +175,69 @@ async def _generate_stream(req: GenerateRequest) -> AsyncIterator[dict]:
             final["result"]["plddt_interp"] = "pLDDT scoring unavailable"
             final["result"]["plddt_pdb"] = None
 
-        # Structural graph features — additive only, derived from the same PDB
-        # structure pLDDT already fetched above. Never raises; null on any
-        # failure (no PDB available, malformed structure, etc).
+        # ── Structural graph analysis (temporarily disabled — will re-enable in future) ──
+        # try:
+        #     pdb_text = plddt.get("pdb")
+        #     if pdb_text:
+        #         from .graph_features import pdb_to_graph_features
+        #         graph = pdb_to_graph_features(pdb_text)
+        #         final["result"]["graph_features"] = graph if graph.get("error") is None else None
+        #     else:
+        #         final["result"]["graph_features"] = None
+        # except Exception:
+        #     final["result"]["graph_features"] = None
+        final["result"]["graph_features"] = None  # placeholder until graph analysis re-enabled
+
+        # DSSP secondary structure — additive only, derived from the same PDB
+        # structure pLDDT already fetched above (no new API call). Never
+        # raises; null on any failure (no PDB, DSSP binary missing, etc).
         try:
             pdb_text = plddt.get("pdb")
             if pdb_text:
-                from .graph_features import pdb_to_graph_features
-                graph = pdb_to_graph_features(pdb_text)
-                final["result"]["graph_features"] = {
-                    "structure_score": graph.get("structure_score"),
-                    "n_hbonds": graph.get("n_hbonds"),
-                    "n_ionic": graph.get("n_ionic"),
-                    "n_pi_pi": graph.get("n_pi_pi"),
-                    "hbond_density": graph.get("hbond_density"),
-                    "ionic_density": graph.get("ionic_density"),
-                    "interpretation": graph.get("interpretation"),
-                } if graph.get("error") is None else None
+                from .dssp_scorer import get_secondary_structure
+                dssp = get_secondary_structure(
+                    pdb_string=pdb_text,
+                    reference_pdb=None,  # reference PDB not fetched separately — no new API call
+                    activities=task.get("activities", []),
+                )
+                final["result"]["secondary_structure"] = {
+                    "ss_string":      dssp.get("ss_string"),
+                    "helix_pct":      dssp.get("helix_pct"),
+                    "sheet_pct":      dssp.get("sheet_pct"),
+                    "turn_pct":       dssp.get("turn_pct"),
+                    "coil_pct":       dssp.get("coil_pct"),
+                    "n_helix":        dssp.get("n_helix"),
+                    "n_sheet":        dssp.get("n_sheet"),
+                    "interpretation": dssp.get("interpretation"),
+                    "ss_similarity":  dssp.get("ss_similarity"),
+                    "dssp_available": dssp.get("dssp_available"),
+                    "error":          dssp.get("error"),
+                }
             else:
-                final["result"]["graph_features"] = None
+                final["result"]["secondary_structure"] = None
         except Exception:
-            final["result"]["graph_features"] = None
+            final["result"]["secondary_structure"] = None
+
+        # BLAST novelty assessment — additive only, runs ONCE on the final
+        # best sequence (never during the retry loop). LOW similarity_score
+        # = novel (good), HIGH = already known (bad). Never raises; null on
+        # any failure (BLAST/makeblastdb not installed, no sequence, etc).
+        try:
+            from .blast_scorer import assess_novelty
+            if r.sequence:
+                blast = await loop.run_in_executor(executor, assess_novelty, r.sequence)
+                final["result"]["blast_similarity"] = {
+                    "similarity_score": blast.get("similarity_score"),
+                    "novelty_label":    blast.get("novelty_label"),
+                    "interpretation":   blast.get("interpretation"),
+                    "blast_available":  blast.get("blast_available"),
+                    "db_exists":        blast.get("db_exists"),
+                    "error":            blast.get("error"),
+                }
+            else:
+                final["result"]["blast_similarity"] = None
+        except Exception:
+            final["result"]["blast_similarity"] = None
 
         yield {"data": json.dumps(final)}
 
