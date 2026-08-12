@@ -335,11 +335,14 @@ function resetResults() {
   document.getElementById('metricPlddt').style.display = 'none';
   document.getElementById('refNote').textContent = '';
   document.getElementById('componentCard').style.display = 'none';
+  document.getElementById('dsspCard').style.display = 'none';
   document.getElementById('structureCard').style.display = 'none';
   currentPdb = null;
   structureViewer = null;
   document.getElementById('structureViewer').innerHTML = '';
   document.getElementById('graphCard').style.display = 'none';
+  // ── Structural graph analysis UI (temporarily disabled) ──
+  // document.getElementById('protein-graph-container').style.display = 'none';
 }
 
 function clearTrace() {
@@ -441,9 +444,11 @@ function renderResult(result) {
   renderPlddt(result.plddt_score, result.plddt_confidence);
   renderStructure(result.plddt_pdb);
   renderGraphFeatures(result.graph_features);
+  renderDssp(result.secondary_structure);
+  renderNovelty(result.blast_similarity);
 
   if (result.components && Object.keys(result.components).length > 0) {
-    renderComponents(result.components, result.plddt_score);
+    renderComponents(result.components, result.plddt_score, result.secondary_structure?.helix_pct);
   }
 }
 
@@ -467,6 +472,68 @@ function renderPlddt(score, confidence) {
   valueEl.textContent = `${score.toFixed(1)}  ${style.label}`;
   valueEl.style.color = style.color;
   badge.style.display = '';
+}
+
+/* BLAST novelty assessment — additive, alongside pLDDT/DSSP */
+const NOVELTY_COLORS = {
+  novel:          { color: '#00e5c3', label: 'Novel' },
+  low_similarity: { color: '#34d399', label: 'Mostly Novel' },
+  similar:        { color: '#fbbf24', label: 'Similar' },
+  known:          { color: '#ef4444', label: 'Known' },
+  unknown:        { color: '#64748b', label: 'N/A' },
+};
+
+function renderNovelty(blast) {
+  const badge = document.getElementById('metricNovelty');
+  const valueEl = document.getElementById('noveltyValue');
+  const card = document.getElementById('noveltyCard');
+  const barsEl = document.getElementById('noveltyBars');
+  const interpEl = document.getElementById('noveltyInterp');
+
+  if (!blast) {
+    badge.style.display = 'none';
+    card.style.display = 'none';
+    return;
+  }
+
+  const style = NOVELTY_COLORS[blast.novelty_label] || NOVELTY_COLORS.unknown;
+
+  if (!blast.blast_available) {
+    badge.style.display = 'none';
+    barsEl.innerHTML = '';
+    interpEl.textContent = 'BLAST not installed (sudo apt-get install ncbi-blast+)';
+    card.style.display = 'block';
+    return;
+  }
+
+  if (!blast.db_exists) {
+    badge.style.display = 'none';
+    barsEl.innerHTML = '';
+    interpEl.textContent = 'Building database... (first run only)';
+    card.style.display = 'block';
+    return;
+  }
+
+  valueEl.textContent = style.label;
+  valueEl.style.color = style.color;
+  badge.style.display = '';
+
+  barsEl.innerHTML = '';
+  if (blast.similarity_score != null) {
+    const row = document.createElement('div');
+    row.className = 'comp-row';
+    row.innerHTML = `
+      <span class="comp-label">Similarity to Database</span>
+      <div class="comp-bar-bg">
+        <div class="comp-bar-fill" style="width:${Math.round(blast.similarity_score * 100)}%;background:${style.color}"></div>
+      </div>
+      <span class="comp-val">${blast.similarity_score.toFixed(2)}</span>
+    `;
+    barsEl.appendChild(row);
+  }
+
+  interpEl.textContent = blast.interpretation || '';
+  card.style.display = 'block';
 }
 
 /* 3D structure (ESMFold PDB) — embedded 3Dmol.js viewer + raw-file download */
@@ -535,6 +602,7 @@ function renderGraphFeatures(graph) {
   const card = document.getElementById('graphCard');
   if (!graph || graph.structure_score == null) {
     card.style.display = 'none';
+    // document.getElementById('protein-graph-container').style.display = 'none';
     return;
   }
 
@@ -555,9 +623,234 @@ function renderGraphFeatures(graph) {
 
   document.getElementById('graphInterp').textContent = graph.interpretation || '';
   card.style.display = 'block';
+
+  // ── Structural graph analysis UI (temporarily disabled) ──
+  // if (graph.edges && graph.nodes) {
+  //   renderProteinGraph(graph);
+  // } else {
+  //   document.getElementById('protein-graph-container').style.display = 'none';
+  // }
 }
 
-function renderComponents(comp, plddtScore) {
+/* Secondary structure (DSSP) — additive, derived from the same ESMFold PDB
+   structure as pLDDT. Fails gracefully (message, not a crash) whenever the
+   mkdssp/dssp binary isn't installed on the server, since that's expected
+   on plenty of machines and never blocks generation. */
+const SS_BAR_COLORS = {
+  helix_pct: '#00e5c3',
+  sheet_pct: '#3b82f6',
+  turn_pct: '#fbbf24',
+  coil_pct: '#64748b',
+};
+const SS_BAR_LABELS = {
+  helix_pct: 'Alpha Helix',
+  sheet_pct: 'Beta Sheet',
+  turn_pct: 'Turn',
+  coil_pct: 'Coil',
+};
+
+function renderDssp(ss) {
+  const card = document.getElementById('dsspCard');
+  if (!ss) {
+    card.style.display = 'none';
+    return;
+  }
+
+  const ssStringEl = document.getElementById('dsspSsString');
+  const barsEl = document.getElementById('dsspBars');
+  const simEl = document.getElementById('dsspSimilarity');
+  const interpEl = document.getElementById('dsspInterp');
+  ssStringEl.innerHTML = '';
+  barsEl.innerHTML = '';
+  simEl.innerHTML = '';
+  interpEl.textContent = '';
+
+  if (!ss.dssp_available) {
+    interpEl.textContent = 'DSSP binary not installed on server. Install with: sudo apt-get install dssp';
+    card.style.display = 'block';
+    return;
+  }
+
+  if (ss.error || ss.helix_pct == null) {
+    interpEl.textContent = 'Secondary structure: unavailable';
+    card.style.display = 'block';
+    return;
+  }
+
+  ssStringEl.textContent = ss.ss_string || '';
+
+  ['helix_pct', 'sheet_pct', 'turn_pct', 'coil_pct'].forEach(key => {
+    const val = ss[key] ?? 0;
+    const row = document.createElement('div');
+    row.className = 'comp-row';
+    row.innerHTML = `
+      <span class="comp-label">${SS_BAR_LABELS[key]}</span>
+      <div class="comp-bar-bg">
+        <div class="comp-bar-fill" style="width:${Math.round(val)}%;background:${SS_BAR_COLORS[key]}"></div>
+      </div>
+      <span class="comp-val">${val.toFixed(1)}%</span>
+    `;
+    barsEl.appendChild(row);
+  });
+
+  if (ss.ss_similarity) {
+    const sim = ss.ss_similarity;
+    const simRow = document.createElement('div');
+    simRow.className = 'comp-row';
+    simRow.innerHTML = `
+      <span class="comp-label">SS Similarity vs Ref</span>
+      <div class="comp-bar-bg">
+        <div class="comp-bar-fill" style="width:${Math.round((sim.overall_ss_similarity ?? 0) * 100)}%"></div>
+      </div>
+      <span class="comp-val">${(sim.overall_ss_similarity ?? 0).toFixed(3)}</span>
+    `;
+    simEl.appendChild(simRow);
+  }
+
+  interpEl.textContent = ss.interpretation || '';
+  card.style.display = 'block';
+}
+
+/* 2D residue-interaction graph (D3 force layout) — raw edges/nodes come from
+   backend/graph_features.py's pdb_to_graph_features(), same PDB structure as
+   the summary metrics above. Purely additive: renderGraphFeatures() already
+   hides the whole card (and this container) whenever graph_features is null. */
+const RESIDUE_COLORS = {
+  K: '#3b82f6', R: '#3b82f6', H: '#60a5fa',
+  D: '#ef4444', E: '#f87171',
+  L: '#00e5c3', I: '#00e5c3', V: '#00e5c3',
+  F: '#00e5c3', W: '#00e5c3', M: '#00e5c3',
+  A: '#34d399', P: '#34d399',
+  S: '#fbbf24', T: '#fbbf24', N: '#fbbf24',
+  Q: '#fbbf24', Y: '#f59e0b', C: '#d97706',
+  G: '#9ca3af',
+};
+
+const EDGE_COLORS = {
+  hbond: '#fbbf24',
+  ionic: '#3b82f6',
+  pi_pi: '#a855f7',
+  hydro: '#34d399',
+  ca_dist: 'rgba(255,255,255,0.05)',
+};
+
+function renderProteinGraph(graphData) {
+  if (!graphData || !graphData.nodes || graphData.nodes.length === 0) {
+    document.getElementById('protein-graph-container').style.display = 'none';
+    return;
+  }
+  if (typeof d3 === 'undefined') {
+    // CDN unreachable — fail gracefully, summary metrics above still show.
+    document.getElementById('protein-graph-container').style.display = 'none';
+    return;
+  }
+
+  const container = document.getElementById('protein-graph-container');
+  const svg = d3.select('#protein-graph');
+  container.style.display = 'block';
+  svg.selectAll('*').remove();
+
+  const width = svg.node().getBoundingClientRect().width || 600;
+  const height = 320;
+  svg.attr('viewBox', `0 0 ${width} ${height}`);
+
+  const nodes = graphData.nodes.map(n => ({ ...n }));
+
+  // Backbone (residue i -> i+1) — pure sequence adjacency, synthesized here
+  // rather than sourced from the API. Without this, any residue with zero
+  // interaction edges has nothing anchoring it, so forceCenter pulls it to
+  // the exact center where it overlaps other orphaned nodes — the "missing
+  // residues" artifact. As a real force-link every node is now anchored to
+  // its sequence neighbors, and the chain is traceable N- to C-terminus.
+  const backbone = [];
+  for (let i = 0; i < nodes.length - 1; i++) {
+    backbone.push({ source: i, target: i + 1, weight: 0.05, type: 'backbone' });
+  }
+
+  // ca_dist omitted — too dense (near-complete graph), clutters the render.
+  const edges = [
+    ...(graphData.edges.hbonds || []),
+    ...(graphData.edges.ionic || []),
+    ...(graphData.edges.pi_pi || []),
+    ...(graphData.edges.hydro || []),
+  ].filter(e => e.weight > 0.005).map(e => ({ ...e }));
+
+  const simulation = d3.forceSimulation(nodes)
+    .force('backbone', d3.forceLink(backbone)
+      .id(d => d.id)
+      .distance(30)
+      .strength(0.6))
+    .force('interactions', d3.forceLink(edges)
+      .id(d => d.id)
+      .distance(d => 40 / (d.weight + 0.01))
+      .strength(0.3))
+    .force('charge', d3.forceManyBody().strength(-80))
+    .force('center', d3.forceCenter(width / 2, height / 2))
+    .force('collision', d3.forceCollide(18))
+    .stop();
+
+  // forceCenter only pulls the *average* position toward center — it does
+  // not stop individual nodes drifting outside the visible canvas, and with
+  // 15-20 residues + repulsion there's not enough room in a 320px-tall box
+  // for that not to happen. Hard-clamp every node back inside the viewBox
+  // (minus a margin for the node radius/label) after every tick so nothing
+  // ends up rendered off-screen with only its edge-stub visible.
+  const margin = 20;
+  for (let i = 0; i < 200; i++) {
+    simulation.tick();
+    for (const n of nodes) {
+      n.x = Math.max(margin, Math.min(width - margin, n.x));
+      n.y = Math.max(margin, Math.min(height - margin, n.y));
+    }
+  }
+
+  // Backbone drawn first (underneath) so the colored interaction edges sit
+  // on top of it.
+  svg.append('g').attr('class', 'backbone')
+    .selectAll('line')
+    .data(backbone)
+    .join('line')
+    .attr('x1', d => d.source.x)
+    .attr('y1', d => d.source.y)
+    .attr('x2', d => d.target.x)
+    .attr('y2', d => d.target.y)
+    .attr('stroke', 'rgba(255,255,255,0.25)')
+    .attr('stroke-width', 1.5);
+
+  svg.append('g').attr('class', 'edges')
+    .selectAll('line')
+    .data(edges)
+    .join('line')
+    .attr('x1', d => d.source.x)
+    .attr('y1', d => d.source.y)
+    .attr('x2', d => d.target.x)
+    .attr('y2', d => d.target.y)
+    .attr('stroke', d => EDGE_COLORS[d.type] || '#ffffff')
+    .attr('stroke-width', d => Math.min(d.weight * 20 + 0.5, 2.5))
+    .attr('stroke-opacity', 0.6);
+
+  const nodeGroup = svg.append('g').attr('class', 'nodes')
+    .selectAll('g')
+    .data(nodes)
+    .join('g')
+    .attr('transform', d => `translate(${d.x},${d.y})`);
+
+  nodeGroup.append('circle')
+    .attr('r', 10)
+    .attr('fill', d => RESIDUE_COLORS[d.residue] || '#64748b')
+    .attr('fill-opacity', 0.85)
+    .attr('stroke', 'rgba(255,255,255,0.2)')
+    .attr('stroke-width', 1);
+
+  nodeGroup.append('text')
+    .attr('class', 'node-label')
+    .text(d => d.residue);
+
+  nodeGroup.append('title')
+    .text(d => `${d.residue} (pos ${d.id + 1})`);
+}
+
+function renderComponents(comp, plddtScore, helixPct) {
   const card = document.getElementById('componentCard');
   const container = document.getElementById('componentScores');
   container.innerHTML = '';
@@ -593,6 +886,21 @@ function renderComponents(comp, plddtScore) {
         <div class="comp-bar-fill" style="width:${Math.round(plddtScore)}%"></div>
       </div>
       <span class="comp-val">${plddtScore.toFixed(1)}</span>
+    `;
+    container.appendChild(row);
+  }
+
+  // Helix % (DSSP) — also 0-100 scale, shown right after pLDDT for the
+  // same reason (structural metric, not a PeptideBLEU component).
+  if (helixPct != null) {
+    const row = document.createElement('div');
+    row.className = 'comp-row';
+    row.innerHTML = `
+      <span class="comp-label">Helix % (DSSP)</span>
+      <div class="comp-bar-bg">
+        <div class="comp-bar-fill" style="width:${Math.round(helixPct)}%;background:#00e5c3"></div>
+      </div>
+      <span class="comp-val">${helixPct.toFixed(1)}%</span>
     `;
     container.appendChild(row);
   }
