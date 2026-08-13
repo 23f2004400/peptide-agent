@@ -340,6 +340,26 @@ def pdb_to_graph_features(pdb_string: str) -> dict:
                 n, len(hbonds), len(ionic), len(pi_pi), structure_score
             ),
             "error":            None,
+
+            # Raw edge/node data for frontend 2D graph rendering — every
+            # interaction finder above returns (source_idx, target_idx,
+            # weight) tuples, so this is just a reshape, not a recompute.
+            "edges": {
+                "hbonds":  [{"source": e[0], "target": e[1], "weight": e[2], "type": "hbond"}
+                            for e in hbonds],
+                "ionic":   [{"source": e[0], "target": e[1], "weight": e[2], "type": "ionic"}
+                            for e in ionic],
+                "pi_pi":   [{"source": e[0], "target": e[1], "weight": e[2], "type": "pi_pi"}
+                            for e in pi_pi],
+                "hydro":   [{"source": e[0], "target": e[1], "weight": e[2], "type": "hydro"}
+                            for e in hydro],
+                "ca_dist": [{"source": e[0], "target": e[1], "weight": e[2], "type": "ca_dist"}
+                            for e in ca_dist],
+            },
+            "nodes": [
+                {"id": i, "residue": _THREE_TO_ONE.get(r.residue, 'X'), "residue_3": r.residue}
+                for i, r in enumerate(residues)
+            ],
         }
         return result
 
@@ -397,4 +417,6 @@ def _empty_graph(error: str) -> dict:
         "sequence_from_pdb": None,
         "interpretation":   error,
         "error":            error,
+        "edges":            None,
+        "nodes":            None,
     }
