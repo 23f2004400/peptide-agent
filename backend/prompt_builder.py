@@ -161,6 +161,25 @@ def _initial_prompt(
             f"but is not identical to the reference.\n"
         )
 
+        # The reference anchor above only ever shows a same-length-ish motif
+        # (opening 4 / closing 3 residues) — if the reference itself is
+        # shorter than the task's minimum length, the model tends to just
+        # reproduce the reference's own length instead of the target range
+        # (observed: 30-40 AA task, 23 AA reference -> 23 AA output). Call
+        # this out explicitly since the length constraint at the top of the
+        # prompt alone wasn't enough to override the reference's pull.
+        if len(ref_upper) < len_lo:
+            anchor_section += (
+                f"\nCRITICAL LENGTH WARNING: The reference sequence above is "
+                f"only {len(ref_upper)} amino acids long. Your generated "
+                f"sequence MUST be {len_lo}-{len_hi} amino acids long — "
+                f"significantly longer than the reference. Use the "
+                f"reference as a MOTIF PATTERN only; extend it with "
+                f"additional residues to reach the required length. Do NOT "
+                f"generate a sequence as short as the reference "
+                f"({len(ref_upper)} AA).\n"
+            )
+
     return (
         f"Generate one {act_str} peptide meeting ALL of:\n"
         f"- Length: between {len_lo} and {len_hi} amino acids\n"

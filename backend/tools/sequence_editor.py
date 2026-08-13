@@ -125,13 +125,25 @@ def deterministic_edit(sequence: str, task: dict) -> str | None:
         return None
 
     target_length = task.get('length', len(sequence))
+    length_min    = task.get('length_min', target_length - 2)
     charge_min    = task.get('charge_min', task.get('charge', 3) - 1)
     charge_max    = task.get('charge_max', task.get('charge', 3) + 2)
     target_charge = (charge_min + charge_max) // 2
     hydro_min     = task.get('hydro_min', 35)
     hydro_max     = task.get('hydro_max', 55)
 
-    edited = sequence
+    edited = sequence.upper()
+
+    # A sequence noticeably short of the required range (e.g. one anchored
+    # on a too-short reference motif) gets padded with a mixed AMP-like
+    # pattern rather than fix_length()'s plain 'L' repeat — an all-'L' pad
+    # spikes hydrophobicity well past target for large gaps, undoing work
+    # the subsequent fix_hydrophobicity() pass then has to redo.
+    if len(edited) < length_min:
+        needed = target_length - len(edited)
+        AMP_PAD = 'GAFVGEIMNSKLLKAFVG'
+        edited = edited + (AMP_PAD * (needed // len(AMP_PAD) + 1))[:needed]
+
     edited = fix_length(edited, target_length)
     edited = fix_charge(edited, target_charge, tolerance=1)
     edited = fix_hydrophobicity(edited, hydro_min, hydro_max)
@@ -325,6 +337,23 @@ def build_edit_prompt(
         instruction += (
             f' Your sequence shares no common subsequence with the reference '
             f'peptide — work this literal fragment in somewhere: "{motif}".'
+        )
+
+    # A rulebook length violation is otherwise invisible to this prompt when
+    # a reference exists — components (PeptideBLEU) drives instruction
+    # selection above and never surfaces raw length, so the model can keep
+    # optimizing charge/hydro/motif while staying the wrong length for many
+    # iterations. Call it out explicitly whenever it's off, regardless of
+    # which component the rotation is currently targeting.
+    length_min_chk = task.get('length_min', length)
+    length_max_chk = task.get('length_max', length)
+    if override_instruction is None and not (length_min_chk <= len(sequence) <= length_max_chk):
+        instruction += (
+            f' CRITICAL: current length is {len(sequence)}, required range is '
+            f'{length_min_chk}-{length_max_chk} amino acids — add residues to reach it.'
+            if len(sequence) < length_min_chk else
+            f' CRITICAL: current length is {len(sequence)}, required range is '
+            f'{length_min_chk}-{length_max_chk} amino acids — remove residues to fit it.'
         )
 
     system = (

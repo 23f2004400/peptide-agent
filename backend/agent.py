@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from . import models
-from .rulebook import validate_sequence, rulebook_score
+from .rulebook import validate_sequence, rulebook_score, HYDROPHOBIC_AAS
 from .peptide_bleu import peptide_metric, score_components, ACTIVITY_WEIGHTS
 from .prompt_builder import build_prompt, get_system_prompt, _resolve_charge
 from .trace_logger import TraceLogger
@@ -107,6 +107,16 @@ _AMP_REFS = [
     ("KLLKLLKLWKK",            +5, +0.9),  # Short AMP (11 AA)
     ("FLGALFKALSHLL",          +2, +1.6),  # Helical AMP (13 AA)
     ("ALWKTMLKKLGTMALHAGKA",   +4, +0.2),  # Dermaseptin-S1 1-20 (20 AA, charge +4, 50% hydrophobic)
+    # The four entries above are all either short (11-13 AA) with compliant
+    # charge, or long (20-22 AA) with charge/hydro outside a common target
+    # band (+2..+5 charge, 40-49% hydro) — for a typical 20-30 AA AMP task in
+    # that band, _pick_reference()'s length term dominates and picks a
+    # charge-noncompliant long entry every time, guaranteeing a rulebook
+    # charge/hydro failure the model then anchors on. These two are verified
+    # (via rulebook.py's real HYDROPHOBIC_AAS, not eyeballed) to sit inside
+    # both ranges at a length that actually competes on the length term too.
+    ("GIGKFLHSAKKFGKAFVGEIMNS", +3, +0.2),  # 23 AA, charge +3, hydro 43.5%
+    ("KFLHSAKKFGKAFVGEIMNS",    +3, +0.2),  # 20 AA, charge +3, hydro 45.0%
 ]
 _SIGNAL_REFS = [
     ("MSVPTQVLGLLLLWLTDARC", 0, +1.2),   # IgK signal (20 AA)
@@ -125,18 +135,57 @@ _PRESET_REF_POOLS = {
 }
 
 
-def _pick_reference(preset: str, target_length: int, target_charge: float) -> str:
+def _hydro_pct(seq: str) -> float:
+    """% of residues in HYDROPHOBIC_AAS (same set rulebook.py scores against)."""
+    return 100 * sum(1 for aa in seq if aa in HYDROPHOBIC_AAS) / max(len(seq), 1)
+
+
+def _pick_reference(
+    preset: str,
+    target_length: int,
+    target_charge: float,
+    target_hydro_pct: float | None = None,
+    length_min: int | None = None,
+    length_max: int | None = None,
+) -> str:
     """
-    Pick the reference whose (length, charge) is closest to the target.
+    Pick the reference whose (length, charge, hydro%) is closest to the target.
     Falls back to the first entry if the preset is unknown.
+
+    target_hydro_pct is optional (older call sites / no hydro range given) —
+    when omitted, selection is unchanged from before (length/charge only).
+    Without it, a preset's default reference can sit well outside a caller's
+    hydrophobicity range (e.g. the AMP pool's 55%-hydro Dermaseptin entry
+    getting picked for a 40-49% target purely because its length/charge is
+    closest) — the model then anchors on that reference's motif and
+    reproduces its hydrophobicity too, failing the rulebook check every time.
+
+    length_min/length_max are optional (task's actual length range, when
+    known) — when given, references inside the range are preferred over
+    ones merely "closest" by distance. Without this, a task whose length
+    range sits entirely above every pool entry's length (e.g. 30-40 AA vs.
+    an AMP pool topping out at 23 AA) always picks the single closest-but-
+    still-too-short entry, and the model tends to anchor on the reference's
+    own length rather than the target range.
     """
     pool = _PRESET_REF_POOLS.get(preset)
     if not pool:
         return ""
-    # Score each reference by Euclidean distance in (length, charge) space.
+
     def dist(entry):
         seq, charge, _ = entry
-        return (len(seq) - target_length) ** 2 + (charge - target_charge) ** 2
+        d = (len(seq) - target_length) ** 2 + (charge - target_charge) ** 2
+        if target_hydro_pct is not None:
+            d += ((_hydro_pct(seq) - target_hydro_pct) / 3) ** 2
+        return d
+
+    if length_min is not None and length_max is not None:
+        in_range = [e for e in pool if length_min <= len(e[0]) <= length_max]
+        if in_range:
+            pool = in_range
+        # else: no entry fits the length range at all — fall through to
+        # closest-by-distance over the full pool, same as before.
+
     return min(pool, key=dist)[0]
 
 
@@ -360,8 +409,19 @@ class PepForgeAgent:
             effective_reference = reference
             reference_used = 'user'
         elif activity_preset:
+            # Prefer an explicit target hydro% (from a hydro_min/hydro_max range,
+            # resolved to a midpoint by server.py); fall back to the legacy
+            # single-value 'hydrophobicity' key only if it looks like a 0-100
+            # percentage rather than a raw Kyte-Doolittle average (which is
+            # typically in roughly [-4.5, 4.5]).
+            target_hydro_pct = task.get('ref_hydrophobic_pct')
+            if target_hydro_pct is None:
+                legacy_hydro = task.get('hydrophobicity')
+                if legacy_hydro is not None and 0 <= legacy_hydro <= 100:
+                    target_hydro_pct = legacy_hydro
             effective_reference = _pick_reference(
-                activity_preset, target_length, target_charge
+                activity_preset, target_length, target_charge, target_hydro_pct,
+                length_min=task.get('length_min'), length_max=task.get('length_max'),
             )
             reference_used = f'default:{activity_preset}'
             logger.info(
