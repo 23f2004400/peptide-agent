@@ -10,3 +10,7 @@ claude_cache/
 .claude/
 logs/
 data/
+eval/**/*.json
+eval/clusters/
+eval/pools/
+eval/results/
