@@ -4,6 +4,25 @@ Dynamic prompt builder with feedback injection for iterative refinement.
 
 from __future__ import annotations
 
+import os
+
+# Models observed reciting the standard prompt's own constraint text back
+# ("Alphabet: The alphabet must include...") instead of generating a
+# sequence — a different manifestation of the same chat_template-less
+# deployment issue documented for OpenBioLLM's prose/explanation failures,
+# but triggered by prompt length/structure rather than fixed by the
+# assistant primer alone. ECHO_PRONE_MODEL=true in .env force-enables the
+# short-prompt path for a model not in this built-in list.
+_ECHO_PRONE_MODELS = ("biomistral", "meditron")
+
+
+def _is_echo_prone_model() -> bool:
+    if os.environ.get("ECHO_PRONE_MODEL", "").strip().lower() == "true":
+        return True
+    model_name = os.environ.get("MODEL_NAME", "").lower()
+    return any(name in model_name for name in _ECHO_PRONE_MODELS)
+
+
 _ACTIVITY_LABELS = {
     "anti-bacterial": "antimicrobial (AMP)",
     "anti-fungal": "antifungal (AMP)",
@@ -97,6 +116,24 @@ def _initial_prompt(
 
     charge_lo_str = f"{charge_lo:+d}"
     charge_hi_str = f"{charge_hi:+d}"
+
+    if _is_echo_prone_model():
+        # Short, direct prompt — minimizes text available to echo back.
+        # Deliberately skips RAG examples and the reference anchor: this
+        # model class was observed reciting the full prompt's own
+        # constraint lines ("Alphabet: The alphabet must include...")
+        # instead of generating, and the full prompt gives far more text
+        # to echo from than this stripped-down version does.
+        return (
+            f"Task: generate one {act_str} peptide sequence.\n\n"
+            f"Requirements:\n"
+            f"- Length: {len_lo} to {len_hi} amino acids\n"
+            f"- Net charge: {charge_lo_str} to {charge_hi_str}\n"
+            f"- Hydrophobic residues: {hydro_lo}% to {hydro_hi}%\n"
+            f"- Use only standard amino acids: ACDEFGHIKLMNPQRSTVWY\n\n"
+            f"Output the peptide sequence only. No explanation. No bullet points. No words.\n\n"
+            f"Sequence:"
+        )
 
     # Build terse inline correction hints from the most recent attempt that had issues.
     # Bracket notes like "[use fewer K/R]" steer residue choice without triggering

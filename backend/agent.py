@@ -35,6 +35,89 @@ ACTIVITY_PRESET_MAP = {
 # Valid single-letter amino acid set
 VALID_AAS_SET = set("ACDEFGHIKLMNPQRSTVWY")
 
+# Text fragments an echo-prone model tends to recite back from the prompt
+# (or from its own training-data recollection of amino-acid definitions)
+# instead of generating a sequence — used only by the diagnostic echo
+# detector and the aggressive-extraction fallback below, both additive to
+# the existing extract_sequence() priorities, never replacing them.
+_ECHO_MARKERS = (
+    "Alphabet:", "alphabet:", "ALPHABET:",
+    "Requirements:", "requirements:",
+    "Length:", "Net charge:", "Hydrophobic",
+    "Output:", "Task:", "Generate",
+    "●", "➢", "•", "→",  # ● ➢ • →
+)
+
+
+def _is_prompt_echo(raw: str) -> bool:
+    """Diagnostic only — does not alter retry control flow (see generate()'s
+    internal retry loop, where this is logged but the existing tuned
+    retry/clean-prompt-fallback behavior is left unchanged; restructuring
+    that loop's for/else fallback semantics around an early exit risked
+    silently dropping the clean-prompt safety net for every model, not
+    just echo-prone ones)."""
+    if not raw:
+        return False
+    return any(marker in raw for marker in _ECHO_MARKERS)
+
+
+def _origin_safe_matches(text: str) -> list[str]:
+    """Regex-scan text for 4+ char valid-AA runs, keeping only matches whose
+    ORIGINAL span was already uppercase — rejects lowercase English words
+    that happen to be spellable in AA letters (e.g. "standard" -> STANDARD)."""
+    found = []
+    for m in VALID_AA_RE.finditer(text.upper()):
+        if text[m.start():m.end()].isupper():
+            found.append(m.group())
+    return found
+
+
+def _aggressive_extract(raw: str, target_length: int | None = None) -> str:
+    """
+    Last-resort extraction, tried only after extract_sequence()'s normal
+    priorities 1-4 all return "" — additive only, never replaces them.
+    Strips text from the first echo marker onward (the model reciting
+    prompt-like constraint text), then re-scans for any run of 4+ valid AA
+    characters anywhere in the remaining text — broader than the
+    primer-prefix fallback (priority 4), which only looks at a position-0
+    prefix.
+
+    Keeps the same case-origin safety check priority 3 uses (original
+    span must already be uppercase), despite an earlier draft of this
+    function omitting it as "last resort, anything goes": testing that
+    version against real echo output found it silently accepted "standard"
+    (from echoed prompt text like '"standard amino acids"') as a fake
+    8-residue sequence "STANDARD" — a real false positive, not a
+    hypothetical one, so the safety check stays.
+    """
+    if not raw:
+        return ""
+
+    cleaned = raw.strip()
+    for marker in _ECHO_MARKERS:
+        idx = cleaned.find(marker)
+        if idx > 0:
+            cleaned = cleaned[:idx].strip()
+
+    candidates = _origin_safe_matches(cleaned)
+    if not candidates:
+        candidates = _origin_safe_matches(raw)
+    if not candidates:
+        return ""
+
+    if target_length:
+        min_acceptable = max(4, int(target_length * 0.5))
+        candidates = [c for c in candidates if len(c) >= min_acceptable]
+        if not candidates:
+            return ""
+        candidates.sort(key=lambda c: abs(len(c) - target_length))
+        best = candidates[0]
+        if len(best) > target_length:
+            best = best[:target_length]
+        return best
+
+    return max(candidates, key=len)
+
 # String used in the STRICT RULES section of the prompt. Any contiguous
 # substring of this that the model echoes back would be a false positive.
 CANONICAL_AA_ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
@@ -352,7 +435,14 @@ class PepForgeAgent:
                     result = result[:target_length]
                 logger.debug("extract: primer-prefix fallback %r", result)
                 return result
-            return ""
+            # Priorities 1-4 above all failed — last-resort additive
+            # fallback for echo-prone models (see _aggressive_extract's
+            # docstring). Does not change behavior for models that never
+            # reach this point.
+            aggressive = _aggressive_extract(raw_stripped, target_length)
+            if aggressive:
+                logger.debug("extract: aggressive fallback recovered %r", aggressive)
+            return aggressive
 
         logger.debug("extract: %d candidate(s): %s", len(candidates), candidates)
 
@@ -560,11 +650,18 @@ class PepForgeAgent:
                     seq = ''
                 if seq and len(seq) >= degenerate_floor:
                     break
-                logger.debug(
-                    "[A%d] internal retry %d/%d: degenerate extraction (len=%d, raw=%r)",
-                    attempt_num, internal_try + 1, INTERNAL_SHORT_RETRY_ATTEMPTS,
-                    len(seq or ''), raw[:60],
-                )
+                if _is_prompt_echo(raw):
+                    logger.debug(
+                        "[A%d] internal retry %d/%d: detected prompt echo (raw=%r) — "
+                        "diagnostic only, retry/fallback behavior unchanged",
+                        attempt_num, internal_try + 1, INTERNAL_SHORT_RETRY_ATTEMPTS, raw[:80],
+                    )
+                else:
+                    logger.debug(
+                        "[A%d] internal retry %d/%d: degenerate extraction (len=%d, raw=%r)",
+                        attempt_num, internal_try + 1, INTERNAL_SHORT_RETRY_ATTEMPTS,
+                        len(seq or ''), raw[:60],
+                    )
             else:
                 # All hint-augmented tries were degenerate — fall back to the
                 # plain, hint-free prompt shape that reliably works better

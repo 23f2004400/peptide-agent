@@ -106,11 +106,48 @@ def _extract_sequence(raw: str, expected_length: int | None = None) -> str:
     return candidates[0]
 
 
+_ECHO_PRONE_MODELS = ("biomistral", "meditron")
+
+
+def _is_echo_prone_model() -> bool:
+    """Same detection as backend/prompt_builder.py's _is_echo_prone_model()
+    — duplicated here (not imported) since the zero-shot/best-of-N arms are
+    deliberately independent of agent.py's prompt-building machinery."""
+    if os.environ.get("ECHO_PRONE_MODEL", "").strip().lower() == "true":
+        return True
+    model_name = os.environ.get("MODEL_NAME", "").lower()
+    return any(name in model_name for name in _ECHO_PRONE_MODELS)
+
+
 def _build_prompt(task: dict) -> str:
     """Build a plain, un-augmented generation prompt from a task spec — no
     RAG, no reference anchor, no assistant primer (see agent.py for those;
     deliberately excluded here since arms 1/2 represent the un-augmented
     baseline this whole eval exists to beat)."""
+    cls = task.get('class', 'bioactive')
+    length = task.get('length', 15)
+    charge = task.get('ref_net_charge', 0)
+    hydro = task.get('ref_hydrophobic_pct', 40)
+
+    if _is_echo_prone_model():
+        # Short, direct prompt for models observed reciting the dataset's
+        # own long natural-language `prompt` field (or the standard
+        # constraint block) back instead of generating — see
+        # backend/prompt_builder.py's _is_echo_prone_model() for the fuller
+        # rationale. Deliberately ignores task['prompt'] entirely here,
+        # since that field is often the single longest, most echo-able
+        # piece of text available to this arm.
+        return (
+            f"Task: generate one {cls} peptide sequence.\n\n"
+            f"Requirements:\n"
+            f"- Length: exactly {length} amino acids\n"
+            f"- Net charge: {charge:+d}\n"
+            f"- Hydrophobic residues: ~{hydro:.0f}%\n"
+            f"- Use only standard amino acids: ACDEFGHIKLMNPQRSTVWY\n\n"
+            f"Output the peptide sequence only. No explanation. No bullet points. No words.\n\n"
+            f"Sequence:"
+        )
+
     prompt = task.get('prompt', '')
     if prompt:
         return (
@@ -119,10 +156,6 @@ def _build_prompt(task: dict) -> str:
             f"Output: one line, uppercase letters only.\n"
             f"Sequence:"
         )
-    cls = task.get('class', 'bioactive')
-    length = task.get('length', 15)
-    charge = task.get('ref_net_charge', 0)
-    hydro = task.get('ref_hydrophobic_pct', 40)
     return (
         f"Generate one {cls} peptide of exactly {length} amino acids.\n"
         f"Net charge: {charge:+d}\n"
