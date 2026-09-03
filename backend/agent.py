@@ -526,7 +526,20 @@ class PepForgeAgent:
         # The assistant turn already starts with these chars, so the model
         # cannot begin with "Explanation:" or other preambles.
         _PRIMERS = {'amp': 'ALWK', 'cpp': 'RKK', 'signal': 'MSV', 'immunological': 'GIL'}
-        assistant_primer = _PRIMERS.get(activity_preset or '', 'KL')
+        # Reasoning models must be free to open with <think> before any
+        # sequence letters — forcing a bare-AA primer (as done below for
+        # non-reasoning models to dodge OpenBioLLM's "Explanation:" prose)
+        # is structurally impossible to combine with that: the primer is
+        # injected as the start of the assistant's turn, so the model can
+        # only continue after it, never write reasoning before it.
+        assistant_primer = '' if models.is_reasoning_model() else _PRIMERS.get(activity_preset or '', 'KL')
+
+        # Non-reasoning models only ever need to emit the bare sequence, so
+        # target_length + 5 is plenty. Reasoning models emit a <think> block
+        # (commonly hundreds of tokens) before the sequence — capping at
+        # target_length + 5 would cut generation off mid-thought and the
+        # sequence would never appear at all.
+        gen_max_tokens = max(600, target_length + 400) if models.is_reasoning_model() else target_length + 5
 
         degenerate_floor = max(5, target_length // 2)
         ESCAPE_TOLERANCE = 0.05
@@ -638,7 +651,7 @@ class PepForgeAgent:
                 raw = models.generate(
                     prompt, system=system,
                     assistant_primer=assistant_primer,
-                    max_tokens=target_length + 5,
+                    max_tokens=gen_max_tokens,
                 )
                 if not raw:
                     continue
@@ -671,7 +684,7 @@ class PepForgeAgent:
                 fallback_raw = models.generate(
                     clean_prompt, system=system,
                     assistant_primer=assistant_primer,
-                    max_tokens=target_length + 5,
+                    max_tokens=gen_max_tokens,
                 )
                 if fallback_raw:
                     fallback_seq = self.extract_sequence(fallback_raw, target_length)
@@ -818,8 +831,8 @@ class PepForgeAgent:
                             trace_log.log_prompt(attempt_num, esc_user)
                             esc_raw = models.generate(
                                 esc_user, system=esc_system,
-                                assistant_primer=edit_base_sequence[:4],
-                                max_tokens=target_length + 5,
+                                assistant_primer='' if models.is_reasoning_model() else edit_base_sequence[:4],
+                                max_tokens=gen_max_tokens,
                                 temperature=temperature,
                             )
                             trace_log.log_raw_response(attempt_num, esc_raw)
@@ -849,8 +862,8 @@ class PepForgeAgent:
                             trace_log.log_prompt(attempt_num, esc_user)
                             esc_raw = models.generate(
                                 esc_user, system=esc_system,
-                                assistant_primer=edit_base_sequence[:4],
-                                max_tokens=target_length + 5,
+                                assistant_primer='' if models.is_reasoning_model() else edit_base_sequence[:4],
+                                max_tokens=gen_max_tokens,
                                 temperature=temperature,
                             )
                             trace_log.log_raw_response(attempt_num, esc_raw)
@@ -890,13 +903,13 @@ class PepForgeAgent:
                         # the activity's generation primer — priming with e.g. "ALWK"
                         # here made the model prepend that primer to (a corrupted copy
                         # of) the original sequence instead of a genuine minimal edit.
-                        edit_primer = edit_base_sequence[:4]
+                        edit_primer = '' if models.is_reasoning_model() else edit_base_sequence[:4]
 
                         for internal_try in range(1 + INTERNAL_SHORT_RETRY_ATTEMPTS):
                             edit_raw = models.generate(
                                 edit_user, system=edit_system,
                                 assistant_primer=edit_primer,
-                                max_tokens=target_length + 5,
+                                max_tokens=gen_max_tokens,
                                 temperature=temperature,
                             )
                             if not edit_raw:

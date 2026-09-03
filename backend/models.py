@@ -26,6 +26,21 @@ def get_model_name() -> str:
     return os.environ.get("MODEL_NAME", "aaditya/OpenBioLLM-Llama3-8B")
 
 
+# Reasoning models (e.g. DeepSeek-R1) emit a <think>...</think> block before
+# the sequence; cutting generation at the first newline (as done below for
+# every other model) would truncate that reasoning. IS_REASONING_MODEL=true
+# forces this regardless of MODEL_NAME; otherwise inferred from the name.
+_REASONING_MODEL_MARKERS = ("deepseek-r1", "qwq", "r1-distill")
+
+
+def is_reasoning_model() -> bool:
+    model_name = get_model_name().lower()
+    return (
+        os.environ.get("IS_REASONING_MODEL", "false").lower() == "true"
+        or any(marker in model_name for marker in _REASONING_MODEL_MARKERS)
+    )
+
+
 EMPTY_RETRY_ATTEMPTS = 4
 
 
@@ -59,9 +74,11 @@ def generate(
     if assistant_primer:
         messages.append({"role": "assistant", "content": assistant_primer})
 
-    create_kwargs = dict(model=model, messages=messages, max_tokens=max_tokens, stop=["\n"])
+    create_kwargs = dict(model=model, messages=messages, max_tokens=max_tokens)
     if temperature is not None:
         create_kwargs["temperature"] = temperature
+    if not is_reasoning_model():
+        create_kwargs["stop"] = ["\n"]
 
     for attempt in range(1 + EMPTY_RETRY_ATTEMPTS):
         response = client.chat.completions.create(**create_kwargs)
