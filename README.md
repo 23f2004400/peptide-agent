@@ -1,362 +1,290 @@
-# PepForge
+# PepForge — Agentic Peptide Generation System
 
-Research project at IIIT-Delhi. An agentic iterative refinement system for novel peptide sequence design using OpenBioLLM-8B, built to demonstrate that an agent loop (generate → validate → score → edit with feedback) beats plain LLM baselines on the PeptideBLEU metric.
+Research project at IIIT-Delhi. PepForge is an agentic iterative-refinement system for peptide sequence design: instead of asking a LLM for a peptide once (or best-of-N), it generates once, then repeatedly **validates, scores, and edits** the sequence toward its weakest property, the same generate → validate → score → edit loop a human designer would run by hand. The research claim this whole project exists to test is that this loop beats plain-LLM prompting on the same base model, measured by **PeptideBLEU**, a 7-component reference-similarity metric purpose-built for peptides (n-gram overlap, charge, hydrophobicity, functional groups, property distribution, structural plausibility, BLOSUM62 substitution similarity).
 
-**Research claim:** Agentic iterative refinement > plain LLM best-of-5 prompting on PeptideBLEU.
-
-| Model | PeptideBLEU (best-of-5) |
-|-------|-------|
-| OpenBioLLM-8B (baseline)  | 0.3014 |
-| SmolLM2-360M (baseline)   | 0.3243 |
-| Gemma-3-1B (baseline)     | 0.3269 |
-| **This agent — best result** | **0.6995** (iteration 1, AMP task) |
 
 ---
 
-## How it works
+## Architecture
 
 ```
-User request (length, charge, hydrophobicity, activities)
+Task specification (length, charge, hydrophobicity, activities)
         │
         ▼
-┌───────────────────────────────────────────────────────────────┐
-│                      PepForgeAgent loop                       │
-│                                                                │
-│  ATTEMPT 1 — generate from scratch, exactly once               │
-│    ├─ RAG: top-5 similar peptides from data/peptides.csv       │
-│    │       (FAISS) injected as prompt examples                 │
-│    ├─ reference anchor: opening/closing motif, charge, hydro%  │
-│    │       — pattern hints only, never the full sequence       │
-│    ├─ OpenBioLLM-8B → raw text                                 │
-│    └─ extract_sequence() ← 3-priority extraction               │
-│         │                                                      │
-│    passed? ──YES──► return best result                         │
-│         │NO                                                    │
-│  ATTEMPTS 2..max_retries — edit the working sequence           │
-│    One edit attempt per iteration; candidates scored and the   │
-│    best one kept (never worse than the true best so far):      │
-│      • deterministic_edit   — length → charge → hydrophobicity │
-│      • llm_edit             — targets current weakest          │
-│      •                        PeptideBLEU component            │
-│      • inject_reference_motif — splices a literal reference    │
-│                                 fragment in (guarantees some    │
-│                                 n-gram overlap deterministically)│
-│    If stuck (no improvement) 1x/2x/3x+ in a row, escalate:     │
-│      escape_positional → escape_forced → escape_exact          │
-│                                                                │
-└───────────────────────────────────────────────────────────────┘
+RAG retrieval — FAISS over data/peptides.csv (105K peptides), top-5
+similar examples injected into the prompt (attempt 1 only)
         │
         ▼
-  Best result across all attempts/candidates (highest score, never a regression)
+Prompt builder — reference anchor (opening/closing motif, charge,
+hydro% hints — never the full reference sequence)
         │
         ▼
-  (additive, after generate() returns — never retried on)
-  pLDDT (ESMFold) · secondary structure (pydssp) · graph_features (disabled)
+LLM generation — via an OpenAI-compatible endpoint (Bhaskera GPU
+tunnel or any compatible gateway)
+        │
+        ▼
+Sequence extraction — 3-priority parser with a case-origin filter,
+rejects English prose masquerading as a sequence
+        │
+        ▼
+PeptideBLEU scoring (needs a reference) + Rulebook validation
+(reference-free, always available)
+        │
+        ▼
+Iterative editing — up to max_retries iterations, one edit
+candidate per iteration (deterministic fix, LLM edit targeting the
+weakest component, or literal reference-motif injection), each
+scored and compared before it can replace the working sequence;
+escalating escape tactics kick in if the loop gets stuck
+        │
+        ▼
+Best result across all attempts (never a regression from the true
+best found so far)
+        │
+        ▼
+Post-hoc, strictly additive — never retried on:
+pLDDT (ESMFold) · secondary structure (pydssp) · BLAST novelty
 ```
 
-The **key differentiator** is targeted, scored editing: instead of blindly resampling, each iteration edits the current best sequence toward a specific weak component (or, when stuck, escalates through increasingly forceful/specific edit tactics), and every candidate — deterministic, LLM-edited, or motif-injected — is scored and compared before anything replaces the working sequence.
+**Reasoning models** (e.g. DeepSeek-R1-Distill-Llama-8B) are supported alongside standard instruction-tuned models: when `IS_REASONING_MODEL=true` (or `MODEL_NAME` contains `deepseek-r1`/`r1-distill`/`qwq`), the agent skips the assistant-primer trick used to stop non-reasoning models from prefacing answers with "Explanation:" (a primer would make it structurally impossible for the model to emit a `<think>` block first), and raises the per-call token budget so the model has room to finish reasoning before the sequence.
 
 ---
 
-## Project structure
+## Key components
 
-```
-peptide-agent/
-├── backend/
-│   ├── __init__.py
-│   ├── agent.py                # Core agent loop (generate once → edit/score loop), PepForgeAgent
-│   ├── models.py                # OpenBioLLM connection via OpenAI-compat vLLM API
-│   ├── peptide_bleu.py          # PeptideBLEU v1.2 scoring (7 components)
-│   ├── rulebook.py               # Amino acid property validation
-│   ├── prompt_builder.py        # Prompt construction — RAG examples + reference anchor
-│   ├── trace_logger.py          # Human-readable per-iteration trace → logs/generation_trace.log
-│   ├── esmfold_scorer.py        # pLDDT structural confidence via ESMFold HF API
-│   ├── dssp_scorer.py            # Secondary structure (helix/sheet/coil %) via pydssp
-│   ├── graph_features.py        # 3D PDB → 2D interaction graph (implemented, currently
-│   │                              #   disabled in server.py — future work)
-│   ├── server.py                 # FastAPI server + SSE streaming
-│   ├── tools/
-│   │   └── sequence_editor.py   # Edit candidates: deterministic fix, llm_edit,
-│   │                              #   motif injection, edit_stuck escape tiers
-│   └── rag/
-│       ├── peptide_retriever.py # FAISS search over data/peptides.csv for prompt examples
-│       └── build_index.py        # One-time FAISS index builder
-├── frontend/
-│   ├── index.html         # Single-page app
-│   ├── app.js             # SSE client, live prompt preview, result rendering
-│   └── style.css          # Dark theme (#0d1117), JetBrains Mono
-├── eval/
-│   ├── run_eval.py        # Batch evaluation (baseline vs agent comparison)
-│   └── protocol_test.py   # Single-task run with a custom stop rule, as a template
-├── data/                  # Not checked in (gitignored) — peptides.csv, peptides_with_length.jsonl,
-│                          #   peptide_index.faiss, peptide_index_meta.pkl
-├── requirements.txt
-└── README.md
-```
+### `backend/`
 
-Planned/future work — not yet implemented: BLAST-based novelty scoring (similarity check against the peptide dataset; low similarity = more novel). No `blast_scorer.py` or BLAST dependency exists in this repo yet.
+| File | Purpose |
+|------|---------|
+| `agent.py` | Core agent loop — `PepForgeAgent.generate()`: one fresh generation, then up to `max_retries` scored edit iterations. |
+| `models.py` | LLM connection via an OpenAI-compatible endpoint; empty-response retries; reasoning-model detection (`is_reasoning_model()`). |
+| `peptide_bleu.py` | PeptideBLEU metric — 7 weighted components, per-activity weight presets. |
+| `rulebook.py` | Reference-free physicochemical validation (length, charge, hydrophobicity, proline runs, cysteine parity, activity constraints). |
+| `prompt_builder.py` | Builds generation/edit prompts — RAG examples, reference anchor, weakest-component edit instructions. |
+| `tools/sequence_editor.py` | Edit candidate generators: deterministic fix, LLM edit, motif injection, and the `edit_stuck` escalation tiers. |
+| `rag/peptide_retriever.py`, `rag/build_index.py` | FAISS similarity search over the local peptide dataset; one-time index builder. |
+| `trace_logger.py` | Appends a full human-readable trace of every iteration to `logs/generation_trace.log`. |
+| `esmfold_scorer.py` | Post-hoc pLDDT structural-confidence scoring via the ESMFold HF Inference API. |
+| `dssp_scorer.py` | Post-hoc secondary-structure (helix/sheet/coil %) via `pydssp`. |
+| `blast_scorer.py`, `blast_db_builder.py` | Post-hoc novelty scoring against the peptide dataset via local BLAST+; one-time database builder. |
+| `graph_features.py` | 3D PDB → 2D interaction graph features — implemented but currently disabled in `server.py` (future work). |
+| `score_seq.py` | Ad-hoc manual scoring scratch script (fill in sequences by hand, not part of the main pipeline). |
+| `server.py` | FastAPI app — `POST /generate` (SSE stream) and `GET /health`. |
+
+### `eval/`
+
+| File | Purpose |
+|------|---------|
+| `cluster_dataset.py` | CD-HIT clustering of the peptide dataset (leak-proofing step 1). |
+| `split_pools.py` | Splits clusters into working pool A / held-out pool B (step 2). |
+| `sample_test_cases.py` | Stratified per-class test-case sampling from pool A (step 3). |
+| `run_three_arm_eval.py` | Runs zero-shot / best-of-N / agent arms per task, scored against pool B; checkpointed to JSONL so a killed run resumes (step 4). |
+| `compare_three_arms.py` | Prints the paper-ready comparison table across all models found in a results directory (step 5). |
+| `run_eval.py` | Older two-arm (baseline vs. agent) batch evaluator, joined against a raw-generations file by `task_id`. |
+| `generate_baseline.py`, `compare_all_models.py` | Alternative, simpler per-model-folder baseline generator + cross-model comparison flow. |
+
+### `frontend/`
+
+`index.html` / `app.js` / `style.css` — single-page app: live prompt preview, SSE-streamed execution trace per attempt, final sequence with colour-coded score, 7-component score bars, optional pLDDT/DSSP panels.
 
 ---
 
-## Setup
+## PeptideBLEU metric
 
-### 1. Prerequisites
+Seven components, weighted and summed; weights are chosen per-activity via a preset (`ACTIVITY_WEIGHTS` in `peptide_bleu.py`).
+
+| Component | Default | AMP | CPP | Signal | Immunological |
+|-----------|---------|-----|-----|--------|---------------|
+| N-gram BLEU | 0.20 | 0.15 | 0.10 | 0.10 | 0.15 |
+| Charge | 0.20 | 0.25 | **0.35** | 0.05 | 0.20 |
+| Hydrophobicity | 0.15 | 0.20 | 0.10 | **0.30** | 0.15 |
+| Functional Group | 0.10 | 0.10 | 0.10 | 0.15 | 0.15 |
+| Property Distribution | 0.10 | 0.10 | 0.10 | 0.15 | 0.10 |
+| Structural | 0.10 | 0.05 | 0.10 | 0.10 | 0.10 |
+| BLOSUM62 | 0.15 | 0.15 | 0.15 | 0.15 | 0.15 |
+
+`anti-bacterial`/`anti-fungal`/`anti-viral`/`anti-cancer` → AMP preset · `drug-delivery` → CPP preset · `signal-peptide` → Signal preset · `immunological` → Immunological preset · everything else → Default.
+
+```python
+from backend.peptide_bleu import peptide_metric
+
+peptide_metric("ACDEFGHIKLMN", "ACDEFGHIKLMN")  # 1.0000 (identity)
+peptide_metric("KLLKLLKLLK",   "KLLKLFKLLK")    # ~0.93  (one substitution)
+```
+
+---
+
+## Evaluation results
+
+Three-arm evaluation (`eval/run_three_arm_eval.py`): zero-shot (single call) vs. best-of-4 (independent calls, best scored against held-out pool B) vs. agent (full PepForge loop). All four models on identical 130 test cases, scored against pool B — sequences the model never saw.
+
+
+| Model | Arm | Valid% | Score | RB-pass% | N-gram | Time |
+|-------|-----|--------|-------|----------|--------|------|
+| OpenBioLLM-70B AWQ | Zero-shot | 100% | 0.5920 | 24.6% | 0.0129 | 2.2s |
+| | Best-of-4 | 100% | 0.6554 | 34.6% | 0.0341 | 3.3s |
+| | **Agent** | 98.5% | **0.6917** | **51.5%** | 0.1630 | 11.6s |
+| BioMistral-7B | Zero-shot | 100% | 0.6280 | 23.8% | 0.0083 | 1.0s |
+| | Best-of-4 | 100% | 0.6758 | 30.0% | 0.0478 | 1.6s |
+| | **Agent** | 99.2% | **0.6329** | **39.2%** | 0.0567 | 11.8s |
+| DeepSeek-R1-Distill-Llama-8B | Zero-shot | 100% | 0.6277 | 41.5% | 0.0048 | 1.9s |
+| | Best-of-4 | 100% | 0.6595 | 60.0% | 0.0078 | 2.0s |
+| | **Agent** | 89.2% | **0.7131** | 50.0% | 0.2144 | 78.5s |
+| Qwen2.5-7B-Instruct | Zero-shot | 100% | 0.6224 | 49.2% | 0.0113 | 1.0s |
+| | Best-of-4 | 100% | 0.6753 | 57.7% | 0.0490 | 1.4s |
+| | **Agent** | 100% | 0.6695 | **62.3%** | 0.0899 | 4.6s |
+
+**Findings:**
+- The agent arm beats *both* baselines outright for **2 of 4 models** — OpenBioLLM-70B AWQ (0.6917 vs. 0.6554/0.5920) and DeepSeek-R1-8B (0.7131 vs. 0.6595/0.6277). 
+- For the other two, the agent arm underperforms its own best-of-4 on mean PeptideBLEU: BioMistral-7B drops sharply (0.6329 vs. 0.6758 best-of-4 — barely above its own zero-shot), and Qwen2.5-7B dips slightly (0.6695 vs. 0.6753). These are honest negative results, not cherry-picked — the agent loop does not uniformly help across every base model, and BioMistral-7B in particular looks like biomedical-QA fine-tuning not transferring well to iterative sequence editing.
+- DeepSeek-R1-8B has the highest agent-arm score of all four (0.7131) and edges out the ~9x-larger OpenBioLLM-70B (0.6917) — suggestive that reasoning-before-answering matters more than raw parameter count here, though this is one run on one metric, not a controlled ablation.
+- Qwen2.5-7B has the best rulebook-pass rate (62.3%) and perfect valid-sequence extraction (100%) of all four on the agent arm, despite its middling raw score.
+- DeepSeek-R1-8B's agent arm is drastically slower per task (78.5s avg) than the other three (1.4s–11.8s), consistent with a reasoning model spending most of its budget on the `<think>` block before ever reaching the sequence.
+
+
+---
+
+## Setup and installation
+
+### Prerequisites
 
 - Python 3.10+
-- Access to the Bhaskera GPU server via Cloudflare tunnel
-- The tunnel URL (changes when restarted — get it from the server admin)
+- An OpenAI-compatible LLM gateway (e.g. the Bhaskera GPU server via Cloudflare tunnel)
+- Optional, only if you need these specific features:
+  - `pydssp` (secondary structure) — installed via `requirements.txt`
+  - NCBI BLAST+ (`makeblastdb`, `blastp`) on `PATH` — for novelty scoring (`blast_scorer.py`)
+  - `cd-hit` on `PATH` (or inside WSL on Windows) — only needed for the leak-proof eval data-prep step (`eval/cluster_dataset.py`)
 
-### 2. Install dependencies
+### Install
 
 ```bash
 cd peptide-agent
+python -m venv venv
+# Windows: venv\Scripts\activate   |   macOS/Linux: source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure environment
+### Configure environment
 
 Create a `.env` file in the project root (not checked in):
 
 ```env
-GATEWAY_URL=https://gotten-governance-troops-sheer.trycloudflare.com/v1
+GATEWAY_URL=https://xxxx.trycloudflare.com/v1
 API_KEY=sk-bhaskera-alice
 MODEL_NAME=aaditya/OpenBioLLM-Llama3-8B
-THRESHOLD=0.35
-MAX_RETRIES=3
-HF_TOKEN=   # optional — raises HuggingFace Inference API rate limits for pLDDT scoring
+IS_REASONING_MODEL=false
 ```
 
-> **Note:** The Cloudflare tunnel URL expires when the server restarts. Update `GATEWAY_URL` in `.env` each time.
-
-### 4. Build the RAG index (one-time, or after `data/peptides.csv` changes)
-
-```bash
-python backend/rag/build_index.py
-```
-
-Builds `data/peptide_index.faiss` + `data/peptide_index_meta.pkl` from `data/peptides.csv`. If skipped, RAG retrieval just degrades to "no examples this run" — it never blocks generation.
+> The Cloudflare tunnel URL changes every time the GPU server restarts — update `GATEWAY_URL` each time, and restart `python -m backend.server` afterward (it only reads `.env` at process start).
 
 ---
 
-## Running
+## Environment variables
 
-### Backend server
+Only variables actually read by the code — see [Setup](#setup-and-installation) above for a working `.env`.
+
+| Variable | Read by | Description | Example |
+|----------|---------|-------------|---------|
+| `GATEWAY_URL` | `backend/models.py` | OpenAI-compatible generation endpoint | `https://xxxx.trycloudflare.com/v1` |
+| `API_KEY` | `backend/models.py` | API key for the gateway above | `sk-bhaskera-alice` |
+| `MODEL_NAME` | `backend/models.py` | Model ID sent in each request | `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` |
+| `IS_REASONING_MODEL` | `backend/models.py`, `backend/agent.py` | Forces reasoning-model handling (skips the assistant primer, raises the token budget). Auto-detected from `MODEL_NAME` if unset — only needed to force it for a model whose name doesn't match `deepseek-r1`/`r1-distill`/`qwq` | `true` |
+| `PEPTIDE_DATASET_PATH` | `backend/rag/peptide_retriever.py`, `backend/blast_scorer.py` | Overrides the default `data/peptides.csv` path | `data/peptides.csv` |
+| `BLAST_DB_PATH` | `backend/blast_scorer.py` | Overrides the default BLAST database path | `data/blast_db/known_peptides_db` |
+
+`threshold` and `max_retries` are **not** `.env` variables — they're per-request fields on `POST /generate` (defaults `0.35` / `6`, see [API](#api) below).
+
+---
+
+## One-time setup
+
+Build the FAISS RAG index (needed once, or whenever `data/peptides.csv` changes — degrades silently to "no RAG examples" if skipped):
 
 ```bash
-# From the peptide-agent/ directory
+python -m backend.rag.build_index
+```
+
+Build the local BLAST database (only needed for novelty scoring; requires `makeblastdb` on `PATH`):
+
+```bash
+python backend/blast_db_builder.py
+```
+
+---
+
+## Running the agent
+
+```bash
+# Terminal 1 — from peptide-agent/, not backend/
 python -m backend.server
 ```
 
-Server starts on `http://localhost:8000`. Verify with:
-
 ```bash
-curl http://localhost:8000/health
-# {"status":"ok","model":"aaditya/OpenBioLLM-Llama3-8B","gateway":"https://..."}
-```
-
-### Frontend
-
-In a second terminal:
-
-```bash
+# Terminal 2
 python -m http.server 8080 --directory frontend
 ```
 
-Open `http://localhost:8080` in your browser. The status dot in the sidebar turns green when the backend is reachable.
+Open `http://localhost:8080`. Verify the backend directly with:
 
----
+```bash
+curl http://localhost:8000/health
+```
 
 ## API
 
 ### `POST /generate`
 
-Runs the agent and streams results via Server-Sent Events.
-
-**Request body:**
-
-```json
-{
-  "length": 12,
-  "charge": 3,
-  "hydrophobicity": 0.5,
-  "activities": ["anti-bacterial", "anti-fungal"],
-  "reference": "KLLKLLKLLKLL",
-  "max_retries": 3,
-  "threshold": 0.35
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `length` | int | Target peptide length in amino acids |
-| `charge` | float | Target net charge (can be negative) |
-| `hydrophobicity` | float | Target average Kyte-Doolittle hydrophobicity |
-| `activities` | list[str] | Biological activity flags (see list below) |
-| `reference` | str (optional) | Ground-truth sequence for PeptideBLEU scoring |
-| `max_retries` | int | Maximum agent iterations (default: 3) |
-| `threshold` | float | PeptideBLEU score to stop early (default: 0.35) |
-
-Valid activity flags: `anti-bacterial`, `anti-cancer`, `anti-fungal`, `anti-parasitic`, `anti-viral`, `cell-cell-communication`, `drug-delivery`, `immunological`, `inhibitor`, `metabolic`, `other-functional`, `signal-peptide`, `toxic`
-
-**SSE stream format:**
+Streams results via Server-Sent Events. Key request fields: `length`/`length_min`/`length_max`, `charge`/`charge_min`/`charge_max`, `hydro_min`/`hydro_max`, `activities` (list), `reference` (optional — auto-selected per activity if omitted), `max_retries` (default 6), `threshold` (default 0.35).
 
 ```
-data: {"type": "attempt", "n": 1, "sequence": "KLLRLLKRLL", "score": 0.31, "status": "fail", "mode": "generate", "issues": [...]}
-data: {"type": "attempt", "n": 2, "sequence": "KLLRKLKRLL", "score": 0.39, "status": "pass", "mode": "motif_inject", "issues": []}
-data: {"type": "final", "result": {
-  "sequence": "KLLRKLKRLL", "score": 0.39, "components": {...}, "iterations": 2, "time_seconds": 4.2,
-  "plddt_score": 78.3, "plddt_confidence": "high", "plddt_passes": true, "plddt_interp": "Confident — reliable backbone predicted",
-  "secondary_structure": {"ss_string": "-HHHHHHHH-", "helix_pct": 80.0, "sheet_pct": 0.0, "turn_pct": 0.0, "coil_pct": 20.0, "dssp_available": true, "error": null},
-  "graph_features": null,
-  "rag_examples_used": 5
-}}
+data: {"type": "attempt", "n": 1, "sequence": "...", "score": 0.31, "status": "fail", "mode": "generate", ...}
+data: {"type": "final", "result": {"sequence": "...", "score": 0.39, "components": {...}, "iterations": 2, ...}}
 ```
-
-`mode` on each attempt event is one of: `generate`, `deterministic`, `llm_edit`, `motif_inject`, `escape_positional`, `escape_forced`, `escape_exact`, `edit_stuck`, `edit_explored` — reflects which candidate won that iteration.
-
-`plddt_score`/`secondary_structure` are `null` (with an `error`/`*_interp` field explaining why) when no sequence was generated or the respective API/library call failed — neither ever blocks or fails the `/generate` response itself. `graph_features` is currently always `null` — the feature is implemented but disabled in `server.py` pending future work.
 
 ### `GET /health`
 
 ```json
-{"status": "ok", "model": "aaditya/OpenBioLLM-Llama3-8B", "gateway": "https://..."}
+{"status": "ok", "model": "...", "gateway": "https://..."}
 ```
 
 ---
 
-## PeptideBLEU v1.2
+## Running evaluation
 
-Seven-component weighted scoring system comparing a generated peptide against a reference sequence.
-
-| Component | Default Weight | AMP weight | CPP weight | Signal weight |
-|-----------|---------------|------------|------------|---------------|
-| C1 N-gram BLEU | 0.20 | 0.15 | 0.10 | 0.10 |
-| C2 Charge | 0.20 | **0.25** | **0.35** | 0.05 |
-| C3 Hydrophobicity | 0.15 | **0.20** | 0.10 | **0.30** |
-| C4 Functional Group | 0.10 | 0.10 | 0.10 | 0.15 |
-| C5 Property Distribution | 0.10 | 0.10 | 0.10 | 0.15 |
-| C6 Structural | 0.10 | 0.05 | 0.10 | 0.10 |
-| C7 BLOSUM62 | 0.15 | 0.15 | 0.15 | 0.15 |
-
-Activity presets are applied automatically based on the activities field (e.g., `anti-bacterial` → AMP preset, `drug-delivery` → CPP preset).
-
-**Known test pairs:**
-
-```python
-from backend.peptide_bleu import peptide_metric
-
-peptide_metric("KLLKLLKLLK",    "KLLKLFKLLK")  # ~0.93  (one substitution)
-peptide_metric("RRWWKK",        "RRWWDD")       # ~0.47  (charge reversal)
-peptide_metric("ACDEFGHIKLMN",  "ACDEFGHIKLMN") # 1.0000 (identity)
-```
-
----
-
-## Rulebook validation
-
-Every generated sequence passes through 7 validation rules before scoring:
-
-1. **Valid amino acids** — only `ACDEFGHIKLMNPQRSTVWY` allowed
-2. **Length tolerance** — within ±2 of target length
-3. **Charge tolerance** — net charge within ±2 of target charge
-4. **Hydrophobicity tolerance** — average KD within ±0.5 of target
-5. **Proline runs** — no more than 3 consecutive prolines (structural implausibility)
-6. **Cysteine parity** — odd cysteine count flagged (disulphide pairing issue)
-7. **Activity constraints** — e.g., `drug-delivery` requires charge +3 to +9; `signal-peptide` requires 15–30 aa
-
-Validation issues drive the deterministic-edit fallback and the rulebook-only edit instruction (when there's no reference to compute PeptideBLEU components against) — see `build_edit_prompt()` in `backend/tools/sequence_editor.py`.
-
----
-
-## Structural confidence (pLDDT / ESMFold)
-
-Supplementary to PeptideBLEU. After the agent returns its final sequence, `backend/esmfold_scorer.py` calls the ESMFold structure-prediction model (`facebook/esmfold_v1`) via the HuggingFace Inference API and reports mean pLDDT (predicted Local Distance Difference Test, Lin et al. 2023, *Science* 379:1123–1130) as a structural-foldability signal, separate from sequence similarity:
-
-| pLDDT | Confidence | Interpretation |
-|-------|-----------|-----------------|
-| ≥ 90 | `very_high` | Excellent — well-folded peptide |
-| 70–90 | `high` | Confident — reliable backbone predicted |
-| 50–70 | `low` | Low — possibly flexible or disordered |
-| < 50 | `very_low` | Likely intrinsically disordered |
-
-This is purely additive and read-only with respect to generation:
-- Computed **once**, on the final sequence, **after** `PepForgeAgent.generate()` returns — it never influences retries, the pass/fail decision, or `NGRAM_FLOOR`/`BLOSUM_FLOOR`.
-- `get_plddt()` never raises — on any failure (invalid sequence, timeout, non-200 response, HF model cold-start) it returns a dict with `error` set and `mean_plddt: None`, so a down/rate-limited ESMFold endpoint never breaks generation.
-- Optional `HF_TOKEN` in `.env` raises the HF Inference API's free-tier rate limit; omitting it still works, just with a lower ceiling and possible `503` cold-start waits (handled with backoff, up to 3 attempts).
-- Surfaced in the `/generate` SSE final event (`plddt_score`, `plddt_confidence`, `plddt_passes`, `plddt_interp`), the frontend results panel (badge + component-scores bar), and optionally in `eval/run_eval.py --mode agent` output (`plddt_score`/`plddt_passes` per result, plus an average/pass-rate summary line) — each call there is a live, serial HTTP request per task, so it noticeably slows down large `--n` eval runs.
-
----
-
-## Secondary structure (DSSP / pydssp)
-
-Also supplementary to PeptideBLEU, computed right after pLDDT on the same ESMFold PDB structure — no extra API call. Classifies each residue as alpha-helix (H), beta-sheet (E), or coil, and reports the composition as a percentage; for AMPs, helix content correlates with membrane-disruption activity, and for CPPs, an amphipathic helix is important for cell penetration.
-
-Uses [`pydssp`](https://pypi.org/project/pydssp/) — a pure-Python/PyTorch reimplementation of DSSP's H-bond-geometry algorithm, not the real `mkdssp`/`dssp` binary — so it works identically on any OS with `pip install pydssp`, no system-level install step. One accuracy tradeoff: `pydssp`'s simplified 3-state output has no separate "Turn" category (real classical DSSP has 8 states); `turn_pct` is always reported as 0, and whatever real DSSP would call "turn" shows up as coil here instead.
-
-Same purely-additive contract as pLDDT: never influences retries or the pass/fail decision, never raises — degrades to `dssp_available: false` if `pydssp` isn't installed, or an `error` string on a malformed/incompatible PDB. Surfaced in the SSE final event (`secondary_structure`), the frontend's "SECONDARY STRUCTURE (DSSP)" card, and `eval/run_eval.py --mode agent` output (`helix_pct`/`sheet_pct`/`ss_similarity` per result, plus an average summary line).
-
----
-
-## Evaluation
-
-The eval script benchmarks agent vs baseline. It needs two inputs: a raw-generations file (`--raw`, one row per task with `task_id` + a list of `generated_sequences` from the plain-LLM baseline run) and the task dataset (`--dataset`, defaults to `data/peptides_with_length.jsonl`) — `run_eval.py` joins them by `task_id` to recover each task's reference sequence, length, charge, and activities (the raw-generations file alone doesn't carry those). `--raw` has no usable default; always pass it explicitly.
-
-### Score the baseline (plain LLM best-of-5)
+The current, leak-proof pipeline (five stages, in order):
 
 ```bash
-python eval/run_eval.py \
-  --mode baseline \
-  --raw results_raw_generations-OpenBioLLM.json \
-  --n 1000 \
-  --output results_baseline.json
+# 1. Cluster the dataset (needs cd-hit on PATH)
+python eval/cluster_dataset.py --dataset data/peptides.csv --output eval/clusters --identity 0.9
+
+# 2. Split clusters into working pool A / held-out pool B
+python eval/split_pools.py --clusters eval/clusters --output eval/pools --seed 42 --split 0.7
+
+# 3. Sample stratified test cases from pool A
+python eval/sample_test_cases.py --pool eval/pools/pool_a_working.json --output eval/test_cases.json --n-per-class 10 --seed 42
+
+# 4. Run the three-arm evaluation for a model (set GATEWAY_URL/MODEL_NAME in .env first)
+python eval/run_three_arm_eval.py \
+    --test-cases eval/test_cases.json \
+    --pool-b eval/pools/pool_b_heldout.json \
+    --output eval/results \
+    --n-bestofn 4 \
+    --model-name ModelName
+
+# 5. Print the comparison table across every model in eval/results/
+python eval/compare_three_arms.py --results eval/results
 ```
 
-### Run the agent
+`run_three_arm_eval.py` checkpoints every `(task_id, arm)` result to `eval/results/checkpoint_<model>.jsonl` as it goes, so a killed/interrupted run resumes from where it left off on the next invocation with the same `--model-name`.
 
-```bash
-python eval/run_eval.py \
-  --mode agent \
-  --raw results_raw_generations-OpenBioLLM.json \
-  --n 1000 \
-  --output results_agent.json \
-  --max-retries 3
-```
-
-### Compare and generate paper table
-
-```bash
-python eval/run_eval.py \
-  --mode compare \
-  --baseline results_baseline.json \
-  --agent results_agent.json
-```
-
-**Output:** (illustrative format — the per-component numbers below come from the `PAPER_BASELINE` constant in `run_eval.py`, a separate/older reference point from the top-of-file baseline table; update `PAPER_BASELINE` if you want this component breakdown to match the current 0.3014 OpenBioLLM-8B baseline)
-
-```
-============================================================
-PEPTIDE GENERATION AGENT — COMPARISON TABLE
-============================================================
-Component                 |   Baseline |    Agent |    Delta
------------------------------|------------|----------|--------
-N-gram BLEU               |     0.0430 |   0.XXXX | +X.XXXX
-Charge                    |     0.3449 |   0.XXXX | +X.XXXX
-Hydrophobicity            |     0.6200 |   0.XXXX | +X.XXXX
-Functional Group          |     0.5800 |   0.XXXX | +X.XXXX
-Property Distribution     |     0.5500 |   0.XXXX | +X.XXXX
-Structural                |     0.7200 |   0.XXXX | +X.XXXX
-BLOSUM62                  |     0.3100 |   0.XXXX | +X.XXXX
-------------------------------------------------------------
-FINAL SCORE               |     0.3784 |   0.XXXX | +X.XXXX
-============================================================
-```
+An older, simpler two-arm flow (`eval/run_eval.py`, baseline vs. agent, joined against a raw-generations file by `task_id`) is still present — see comments at the top of that file for its `--raw`/`--mode` usage.
 
 ---
 
 ## Amino acid reference
 
 | AA | Charge | KD Hydrophobicity | Class |
-|----|--------|-------------------|-------|
+|----|--------|--------------------|-------|
 | A (Ala) | 0 | +1.8 | Aliphatic |
 | R (Arg) | +1 | −4.5 | Positively charged |
 | N (Asn) | 0 | −3.5 | Polar uncharged |
@@ -382,15 +310,59 @@ Hydrophobic residues (for % calculation): `A V I L M F Y W`
 
 ---
 
-## Frontend UI
+## Adding a new model
 
-The browser interface at `localhost:8080` matches the research demo screenshot:
+No repo-side config files are needed — model selection is entirely `.env`-driven:
 
-- **Left sidebar** — Quick-start presets (Antimicrobial, Cell-Penetrating), model/provider/status
-- **Peptide Specification panel** — Live prompt preview (updates as you type), property inputs, activity checkboxes, optional reference sequence
-- **Results panel** — Real-time execution trace (SSE-streamed per attempt, badged by mode — generate/deterministic/llm_edit/motif_inject/escape tiers), final sequence with colour-coded score, 7-component score bars, an optional pLDDT badge + component-scores row, and a "SECONDARY STRUCTURE (DSSP)" card (SS string, helix/sheet/turn/coil bars) when structural scoring succeeds
+1. Point `GATEWAY_URL` at an OpenAI-compatible endpoint serving the model.
+2. Set `MODEL_NAME` to the model's ID as the gateway expects it.
+3. If it's a reasoning model that emits `<think>...</think>` before its answer, set `IS_REASONING_MODEL=true` (or make sure `MODEL_NAME` contains `deepseek-r1`, `r1-distill`, or `qwq` — that auto-detects it).
+4. Restart `python -m backend.server` (it only reads `.env` at process start).
+5. To add it to the evaluation table, run `eval/run_three_arm_eval.py --model-name <Name>` and then `eval/compare_three_arms.py`.
 
-Score colour coding: green ≥ 0.35 (above threshold), amber 0.25–0.35, red < 0.25. pLDDT badge colour coding: teal ≥ 90 (Very High), blue 70–90 (Confident), amber 50–70 (Low), red < 50 (Very Low).
+---
+
+## File structure
+
+```
+peptide-agent/
+├── backend/
+│   ├── agent.py                  # Core agent loop (PepForgeAgent)
+│   ├── models.py                 # LLM connection + reasoning-model detection
+│   ├── peptide_bleu.py           # PeptideBLEU metric
+│   ├── rulebook.py               # Reference-free validation
+│   ├── prompt_builder.py         # Prompt construction
+│   ├── trace_logger.py           # logs/generation_trace.log writer
+│   ├── esmfold_scorer.py         # pLDDT (post-hoc)
+│   ├── dssp_scorer.py            # Secondary structure (post-hoc)
+│   ├── blast_scorer.py           # Novelty scoring (post-hoc)
+│   ├── blast_db_builder.py       # One-time BLAST DB builder
+│   ├── graph_features.py         # PDB → graph features (implemented, disabled)
+│   ├── score_seq.py              # Manual ad-hoc scoring scratch script
+│   ├── server.py                 # FastAPI + SSE
+│   ├── tools/
+│   │   └── sequence_editor.py    # Edit candidates + escape tiers
+│   └── rag/
+│       ├── peptide_retriever.py  # FAISS retrieval
+│       └── build_index.py        # One-time index builder
+├── frontend/
+│   ├── index.html
+│   ├── app.js
+│   └── style.css
+├── eval/
+│   ├── cluster_dataset.py        # Leak-proofing step 1 (CD-HIT)
+│   ├── split_pools.py            # Leak-proofing step 2 (pool A/B)
+│   ├── sample_test_cases.py      # Leak-proofing step 3 (stratified sampling)
+│   ├── run_three_arm_eval.py     # Zero-shot / best-of-N / agent evaluation
+│   ├── compare_three_arms.py     # Cross-model comparison table
+│   ├── run_eval.py               # Older two-arm baseline/agent evaluator
+│   ├── generate_baseline.py      # Alternative per-model baseline generator
+│   ├── compare_all_models.py     # Alternative per-model-folder comparison
+│   └── results/                  # Gitignored — checkpoint_*.jsonl, results_*.json
+├── data/                         # Gitignored — peptides.csv, FAISS index, BLAST DB
+├── requirements.txt
+└── README.md
+```
 
 ---
 
@@ -398,12 +370,16 @@ Score colour coding: green ≥ 0.35 (above threshold), amber 0.25–0.35, red < 
 
 | Problem | Fix |
 |---------|-----|
-| Status dot red | Check `GATEWAY_URL` in `.env` — tunnel may have expired |
-| `GATEWAY_URL not set` error | Create `.env` in the project root and fill in the URL (see Setup) |
-| Sequence extraction fails | Model returned prose — the regex will pick the longest valid AA run; if empty, check the model is responding |
-| Score always 0 | No reference sequence provided — PeptideBLEU requires a ground-truth sequence |
-| `ModuleNotFoundError` | Run server from the `peptide-agent/` directory, not from `backend/` |
-| pLDDT badge never appears / `plddt_score` always `null` | ESMFold HF endpoint cold-starting, rate-limited, or unreachable — check `plddt_interp` in the response for the specific reason; generation itself is unaffected |
-| Secondary structure card missing / `dssp_available: false` | `pydssp` not installed | `pip install pydssp` (already in `requirements.txt`) |
-| RAG examples never show up | `data/peptides.csv` or the FAISS index missing | `python backend/rag/build_index.py`; RAG degrades silently to no examples if this was never run |
-| `eval/run_eval.py` — `FileNotFoundError` on `--raw` | No usable default for `--raw` | Always pass `--raw <path>` explicitly (see Evaluation) |
+| Status dot red / `GATEWAY_URL not set` | Check/create `.env`, restart the server after any edit |
+| Sequence extraction fails for a reasoning model | Check `MODEL_NAME`/`IS_REASONING_MODEL` — without reasoning-mode enabled, the token budget is too small for a `<think>` block to complete |
+| Score always 0 | No reference sequence resolved for this activity — PeptideBLEU needs one |
+| `ModuleNotFoundError` | Run the server from `peptide-agent/`, not from `backend/` |
+| RAG examples never show up | `data/peptides.csv` or the FAISS index missing — run `python -m backend.rag.build_index` |
+| Novelty/BLAST fields always null | `makeblastdb`/`blastp` not on `PATH`, or `python backend/blast_db_builder.py` was never run |
+| `eval/cluster_dataset.py` fails to find cd-hit | Install `cd-hit` (`apt-get install cd-hit` / `conda install -c bioconda cd-hit`), or run it inside WSL on Windows |
+
+---
+
+## Acknowledgements
+
+IIIT-Delhi · Dr. Bapi Chatterjee · Tanya Sheemar
